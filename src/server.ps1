@@ -132,9 +132,22 @@ while ($listener.IsListening) {
         }
     }
     catch {
-        Write-Host "ERROR $path : $($_.Exception.Message)"
+        # Connect-ExchangeOnline / Connect-IPPSSession collapse a lot of distinct
+        # failures into a bare "UnAuthorized", so surface the whole error record.
+        # Without the inner exception and category there is nothing to act on.
+        $err = $_
+        Write-Host "ERROR $path : $($err.Exception.Message)"
         try {
-            Write-Json $response @{ error = $_.Exception.Message; path = $path } 500
+            Write-Json $response @{
+                error     = $err.Exception.Message
+                type      = $err.Exception.GetType().FullName
+                inner     = if ($err.Exception.InnerException) { $err.Exception.InnerException.Message } else { $null }
+                category  = $err.CategoryInfo.ToString()
+                target    = $err.TargetObject
+                detail    = ($err.Exception.ToString() -split "`n" | Select-Object -First 20) -join ' | '
+                stack     = ($err.ScriptStackTrace -split "`n" | Select-Object -First 6) -join ' | '
+                path      = $path
+            } 500
         }
         catch { }
     }
