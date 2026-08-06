@@ -87,32 +87,34 @@ while ($listener.IsListening) {
         switch ("$($request.HttpMethod) $path") {
 
             'POST /block-sender' {
-                if (-not $body.senders) { Write-Json $response @{ error = 'senders is required' } 400; break }
+                # Index rather than dot-access: under StrictMode a missing hashtable
+                # key thrown as a property error would surface as a 500, not a 400.
+                if (-not $body['senders']) { Write-Json $response @{ error = 'senders is required' } 400; break }
                 $result = Invoke-BlockSender `
-                    -Senders ([string[]]$body.senders) `
-                    -Notes ($body.notes ?? 'Blocked by automated eSentire response workflow') `
-                    -ExpirationDays ([int]($body.expiration_days ?? 0))
+                    -Senders ([string[]]$body['senders']) `
+                    -Notes ($body['notes'] ?? 'Blocked by automated eSentire response workflow') `
+                    -ExpirationDays ([int]($body['expiration_days'] ?? 0))
                 Write-Json $response $result
                 break
             }
 
             'POST /search' {
-                if (-not $body.query) { Write-Json $response @{ error = 'query (KQL) is required' } 400; break }
+                if (-not $body['query']) { Write-Json $response @{ error = 'query (KQL) is required' } 400; break }
                 $result = Invoke-ComplianceSearch `
-                    -Query $body.query `
-                    -Name $body.name `
-                    -Mailboxes ([string[]]($body.mailboxes ?? @()))
+                    -Query $body['query'] `
+                    -Name $body['name'] `
+                    -Mailboxes ([string[]]($body['mailboxes'] ?? @()))
                 Write-Json $response $result
                 break
             }
 
             'POST /purge' {
-                if (-not $body.search_name) { Write-Json $response @{ error = 'search_name is required' } 400; break }
-                $type = $body.purge_type ?? 'SoftDelete'
+                if (-not $body['search_name']) { Write-Json $response @{ error = 'search_name is required' } 400; break }
+                $type = $body['purge_type'] ?? 'SoftDelete'
                 if ($type -notin @('SoftDelete', 'HardDelete')) {
                     Write-Json $response @{ error = "purge_type must be SoftDelete or HardDelete" } 400; break
                 }
-                $result = Invoke-CompliancePurge -SearchName $body.search_name -PurgeType $type
+                $result = Invoke-CompliancePurge -SearchName $body['search_name'] -PurgeType $type
                 Write-Json $response $result
                 break
             }
