@@ -8,7 +8,7 @@ services:
     container_name: m365-response-worker
     restart: unless-stopped
     ports:
-      - "${WORKER_PORT:-3022}:8080"
+      - "${WORKER_PORT:-3024}:8080"
     environment:
       # App-only auth. The certificate is mounted, never baked into the image.
       - EXO_APP_ID=${EXO_APP_ID}

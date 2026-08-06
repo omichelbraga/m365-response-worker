@@ -60,7 +60,7 @@ Set these as stack environment variables:
 | `EXO_CERT_PASSWORD` | PFX password |
 | `EXO_CERT_HOST_DIR` | Host directory holding `exo.pfx` |
 | `WORKER_TOKEN` | Bearer token callers must present |
-| `WORKER_PORT` | Published host port (default 3022) |
+| `WORKER_PORT` | Published host port (default 3024) |
 
 ## Gotchas this encodes
 
