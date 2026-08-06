@@ -38,9 +38,21 @@ function Connect-Exo {
     if (-not $org) { throw 'EXO_ORGANIZATION is not set.' }
 
     if ($SearchOnly) {
-        # -EnableSearchOnlySession is required for purge actions to run at all.
-        Connect-IPPSSession -Certificate $cert -AppId $appId -Organization $org `
-            -EnableSearchOnlySession -ShowBanner:$false | Out-Null
+        # -EnableSearchOnlySession is documented as required for purge, but that
+        # guidance is for delegated sessions: with app-only certificate auth the
+        # flag makes Connect-IPPSSession fail outright with "UnAuthorized", while
+        # the identical connection without it succeeds. Verified against this
+        # tenant via /diag (scc_plain ok, scc_search_only UnAuthorized).
+        # Set EXO_SEARCH_ONLY_SESSION=1 to re-enable if that ever changes.
+        $useSearchOnly = ($env:EXO_SEARCH_ONLY_SESSION -in @('1', 'true', 'yes'))
+        if ($useSearchOnly) {
+            Connect-IPPSSession -Certificate $cert -AppId $appId -Organization $org `
+                -EnableSearchOnlySession -ShowBanner:$false | Out-Null
+        }
+        else {
+            Connect-IPPSSession -Certificate $cert -AppId $appId -Organization $org `
+                -ShowBanner:$false | Out-Null
+        }
     }
     else {
         Connect-ExchangeOnline -Certificate $cert -AppId $appId -Organization $org `
