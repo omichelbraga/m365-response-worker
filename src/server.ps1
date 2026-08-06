@@ -86,6 +86,11 @@ while ($listener.IsListening) {
 
         switch ("$($request.HttpMethod) $path") {
 
+            'GET /diag' {
+                Write-Json $response (Invoke-Diagnostics)
+                break
+            }
+
             'POST /block-sender' {
                 # Index rather than dot-access: under StrictMode a missing hashtable
                 # key thrown as a property error would surface as a 500, not a 400.

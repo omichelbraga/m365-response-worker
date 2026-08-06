@@ -52,6 +52,55 @@ function Disconnect-Exo {
     try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch { }
 }
 
+function Invoke-Diagnostics {
+    <#
+      Read-only. Tests the three connection modes independently so a failure can
+      be attributed to a specific layer rather than the single "UnAuthorized"
+      that Connect-IPPSSession surfaces for everything.
+
+        exchange_online  -> governed by the Entra Exchange Administrator role
+        scc_plain        -> governed by Purview role group membership
+        scc_search_only  -> as above, plus -EnableSearchOnlySession (needed to purge)
+
+      If exchange_online succeeds and both scc_* fail, the identity is fine and
+      the Purview role group membership is the problem.
+    #>
+    $results = [ordered]@{}
+
+    try {
+        Connect-Exo
+        $org = (Get-OrganizationConfig).Name
+        $results['exchange_online'] = @{ ok = $true; organization = "$org" }
+    }
+    catch { $results['exchange_online'] = @{ ok = $false; error = $_.Exception.Message } }
+    finally { Disconnect-Exo }
+
+    try {
+        $cert = Get-ExoCertificate
+        Connect-IPPSSession -Certificate $cert -AppId $env:EXO_APP_ID `
+            -Organization $env:EXO_ORGANIZATION -ShowBanner:$false | Out-Null
+        $n = @(Get-ComplianceSearch -ResultSize 1).Count
+        $results['scc_plain'] = @{ ok = $true; searches_visible = $n }
+    }
+    catch { $results['scc_plain'] = @{ ok = $false; error = $_.Exception.Message } }
+    finally { Disconnect-Exo }
+
+    try {
+        Connect-Exo -SearchOnly
+        $n = @(Get-ComplianceSearch -ResultSize 1).Count
+        $results['scc_search_only'] = @{ ok = $true; searches_visible = $n }
+    }
+    catch { $results['scc_search_only'] = @{ ok = $false; error = $_.Exception.Message } }
+    finally { Disconnect-Exo }
+
+    return @{
+        action       = 'diagnostics'
+        app_id       = $env:EXO_APP_ID
+        organization = $env:EXO_ORGANIZATION
+        results      = $results
+    }
+}
+
 function Invoke-BlockSender {
     <#
       Adds a sender to the Tenant Allow/Block List. There is no REST equivalent:
