@@ -1,0 +1,9 @@
+.git/
+.gitignore
+*.pfx
+*.cer
+*.key
+*.pem
+.env
+.env.*
+README.md

@@ -1,0 +1,43 @@
+version: "3.8"
+
+services:
+  m365-response-worker:
+    build:
+      context: https://github.com/omichelbraga/m365-response-worker.git#main
+      dockerfile: Dockerfile
+    container_name: m365-response-worker
+    restart: unless-stopped
+    ports:
+      - "${WORKER_PORT:-3022}:8080"
+    environment:
+      # App-only auth. The certificate is mounted, never baked into the image.
+      - EXO_APP_ID=${EXO_APP_ID}
+      - EXO_ORGANIZATION=${EXO_ORGANIZATION}
+      - EXO_CERT_PATH=/certs/exo.pfx
+      - EXO_CERT_PASSWORD=${EXO_CERT_PASSWORD}
+      - WORKER_TOKEN=${WORKER_TOKEN}
+      - WORKER_PORT=8080
+    volumes:
+      # Place exo.pfx on the Docker host at this path, readable by uid 10002.
+      - ${EXO_CERT_HOST_DIR:-/opt/m365-worker/certs}:/certs:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - m365_net
+      - mcp-edge
+
+networks:
+  m365_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.12.0/24
+  # Shared with the reverse proxy and n8n so they can reach this by name.
+  mcp-edge:
+    external: true
