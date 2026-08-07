@@ -7,6 +7,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 . "$PSScriptRoot/actions.ps1"
+. "$PSScriptRoot/graph.ps1"
 
 $Port = if ($env:WORKER_PORT) { $env:WORKER_PORT } else { '8080' }
 $Token = $env:WORKER_TOKEN
@@ -105,22 +106,21 @@ while ($listener.IsListening) {
 
             'POST /search' {
                 if (-not $body['query']) { Write-Json $response @{ error = 'query (KQL) is required' } 400; break }
-                $result = Invoke-ComplianceSearch `
-                    -Query $body['query'] `
-                    -Name $body['name'] `
-                    -Mailboxes ([string[]]($body['mailboxes'] ?? @()))
-                Write-Json $response $result
+                Write-Json $response (Invoke-GraphSearch -Query $body['query'] -Name $body['name'])
                 break
             }
 
             'POST /purge' {
-                if (-not $body['search_name']) { Write-Json $response @{ error = 'search_name is required' } 400; break }
+                # case_id and search_id come straight back from /search, so the
+                # purge acts on exactly the set whose counts were approved.
+                if (-not $body['case_id'] -or -not $body['search_id']) {
+                    Write-Json $response @{ error = 'case_id and search_id are required (both returned by /search)' } 400; break
+                }
                 $type = $body['purge_type'] ?? 'SoftDelete'
                 if ($type -notin @('SoftDelete', 'HardDelete')) {
-                    Write-Json $response @{ error = "purge_type must be SoftDelete or HardDelete" } 400; break
+                    Write-Json $response @{ error = 'purge_type must be SoftDelete or HardDelete' } 400; break
                 }
-                $result = Invoke-CompliancePurge -SearchName $body['search_name'] -PurgeType $type
-                Write-Json $response $result
+                Write-Json $response (Invoke-GraphPurge -CaseId $body['case_id'] -SearchId $body['search_id'] -PurgeType $type)
                 break
             }
 
