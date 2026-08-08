@@ -169,7 +169,7 @@ function Invoke-GraphSearch {
     $caseId = Get-WorkerCase
     $scoped = ($Mailboxes -and $Mailboxes.Count -gt 0)
 
-    $search = Invoke-Graph -Method POST -Path "/security/cases/ediscoveryCases/$caseId/searches" -Body @{
+    $createBody = @{
         displayName      = $Name
         contentQuery     = $Query
         # 'none' plus explicit additionalSources is how a search is pinned to
@@ -178,16 +178,22 @@ function Invoke-GraphSearch {
     }
 
     if ($scoped) {
-        foreach ($mbx in $Mailboxes) {
-            Invoke-Graph -Method POST `
-                -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)/additionalSources" `
-                -Body @{
+        # The sources must be inline on create. POSTing them afterwards to the
+        # additionalSources collection is too late -- creating a search with
+        # scope 'none' and no sources is rejected outright with
+        # "At least one data source is required."
+        $createBody['additionalSources'] = @(
+            foreach ($mbx in $Mailboxes) {
+                @{
                     '@odata.type'   = 'microsoft.graph.security.userSource'
                     email           = $mbx
                     includedSources = 'mailbox'
-                } | Out-Null
-        }
+                }
+            }
+        )
     }
+
+    $search = Invoke-Graph -Method POST -Path "/security/cases/ediscoveryCases/$caseId/searches" -Body $createBody
 
     Invoke-Graph -Method POST `
         -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)/estimateStatistics" | Out-Null
