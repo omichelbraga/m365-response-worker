@@ -87,16 +87,25 @@ function Invoke-Graph {
         [Parameter(Mandatory)][string]$Method,
         [Parameter(Mandatory)][string]$Path,
         $Body,
-        [string]$ApiVersion = 'v1.0'
+        [string]$ApiVersion = 'v1.0',
+        # Long-running actions answer 202 with an empty body and put the
+        # operation URL in the Location header, so those callers need the whole
+        # response rather than the parsed content.
+        [switch]$Raw
     )
     $token = Get-GraphToken
     $uri = "https://graph.microsoft.com/$ApiVersion$Path"
     $headers = @{ Authorization = "Bearer $token" }
+
+    # Not $args: that is an automatic variable inside a function.
+    $req = @{ Method = $Method; Uri = $uri; Headers = $headers }
     if ($null -ne $Body) {
-        return Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers `
-            -Body ($Body | ConvertTo-Json -Depth 10) -ContentType 'application/json'
+        $req['Body'] = ($Body | ConvertTo-Json -Depth 10)
+        $req['ContentType'] = 'application/json'
     }
-    return Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers
+
+    if ($Raw) { return Invoke-WebRequest @req }
+    return Invoke-RestMethod @req
 }
 
 function Get-WorkerCase {
@@ -129,7 +138,11 @@ function Invoke-GraphSearch {
     param(
         [Parameter(Mandatory)][string]$Query,
         [string]$Name,
-        [int]$TimeoutSeconds = 600
+        # A tenant-wide estimate for a single sender over eight days was measured
+        # at 730 s against this tenant, so the old 600 s ceiling failed every
+        # real search a couple of minutes before Graph finished. Callers run this
+        # on a background job, so a generous ceiling costs nothing.
+        [int]$TimeoutSeconds = 3600
     )
 
     if (-not $Name) { $Name = "auto-$([guid]::NewGuid().ToString('N').Substring(0,12))" }
@@ -144,10 +157,12 @@ function Invoke-GraphSearch {
     Invoke-Graph -Method POST `
         -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)/estimateStatistics" | Out-Null
 
+    # Estimates run for minutes, so poll every 15 s rather than every 5: the
+    # extra calls buy nothing and count against the Graph throttle budget.
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $op = $null
     do {
-        Start-Sleep -Seconds 5
+        Start-Sleep -Seconds 15
         $op = Invoke-Graph -Method GET `
             -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)/lastEstimateStatisticsOperation"
     } while ($op.status -in @('notStarted', 'running', 'submitted') -and (Get-Date) -lt $deadline)
@@ -180,9 +195,20 @@ function Invoke-GraphPurge {
     # Graph names these differently to the PowerShell cmdlet.
     $graphType = if ($PurgeType -eq 'HardDelete') { 'permanentlyDelete' } else { 'recoverable' }
 
-    Invoke-Graph -Method POST `
+    # 202 with an empty body: the only handle on the running purge is the
+    # operation URL in the Location header. Without it there is no way to report
+    # whether a hard delete actually landed.
+    $resp = Invoke-Graph -Raw -Method POST `
         -Path "/security/cases/ediscoveryCases/$CaseId/searches/$SearchId/purgeData" `
-        -Body @{ purgeType = $graphType; purgeAreas = 'mailboxes' } | Out-Null
+        -Body @{ purgeType = $graphType; purgeAreas = 'mailboxes' }
+
+    $opId = $null
+    $location = $resp.Headers['Location']
+    if ($location) {
+        # e.g. .../ediscoveryCases('<case>')/operations('<op>')
+        $m = [regex]::Match(([string]$location), "operations\('?([^')]+)'?\)")
+        if ($m.Success) { $opId = $m.Groups[1].Value }
+    }
 
     return @{
         action       = 'graph_ediscovery_purge'
@@ -191,7 +217,33 @@ function Invoke-GraphPurge {
         purge_type   = $PurgeType
         graph_type   = $graphType
         irreversible = ($PurgeType -eq 'HardDelete')
+        operation_id = $opId
+        http_status  = [int]$resp.StatusCode
         status       = 'submitted'
-        note         = 'purgeData is asynchronous; Graph returns 202 with no body on acceptance.'
+        note         = 'purgeData is asynchronous. Poll /purge-status?operation_id=... for the outcome.'
+    }
+}
+
+function Get-GraphPurgeStatus {
+    <#
+      Replaces the Security & Compliance Get-ComplianceSearchAction path, which
+      is unreachable under app-only auth (see the header of this file).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$CaseId,
+        [Parameter(Mandatory)][string]$OperationId
+    )
+
+    $op = Invoke-Graph -Method GET -Path "/security/cases/ediscoveryCases/$CaseId/operations/$OperationId"
+
+    return @{
+        action       = 'graph_ediscovery_purge_status'
+        case_id      = $CaseId
+        operation_id = $OperationId
+        status       = $op.status
+        percent      = $op.percentProgress
+        created      = $op.createdDateTime
+        completed    = $op.completedDateTime
+        graph_action = $op.action
     }
 }

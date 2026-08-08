@@ -52,6 +52,67 @@ function Test-Auth {
     return ($diff -eq 0)
 }
 
+# --- Background search jobs -------------------------------------------------
+#
+# HttpListener.GetContext() serves one request at a time, so anything slow on
+# the request thread takes the whole worker down with it -- including /health,
+# which is how this container kept flapping to unhealthy.
+#
+# A tenant-wide eDiscovery estimate was measured at 730 s against this tenant.
+# Nothing sane waits that long on an HTTP request, so /search hands the work to
+# a background runspace and answers 202 immediately; the caller polls
+# /search-status. The request thread then never blocks for more than a moment.
+
+$script:Jobs = [hashtable]::Synchronized(@{})
+$script:Pool = [runspacefactory]::CreateRunspacePool(1, 4)
+$script:Pool.Open()
+
+function Start-SearchJob {
+    param(
+        [Parameter(Mandatory)][string]$Query,
+        [string]$Name
+    )
+
+    $jobId = [guid]::NewGuid().ToString('N').Substring(0, 16)
+    $script:Jobs[$jobId] = @{
+        job_id  = $jobId
+        status  = 'running'
+        query   = $Query
+        name    = $Name
+        started = (Get-Date).ToUniversalTime().ToString('o')
+    }
+
+    $ps = [powershell]::Create()
+    $ps.RunspacePool = $script:Pool
+    [void]$ps.AddScript({
+        param($ScriptRoot, $Jobs, $JobId, $Query, $Name)
+        # A fresh runspace shares no state with the server, so the modules have
+        # to be dot-sourced again. Environment variables are process-wide and
+        # come across on their own.
+        try {
+            . "$ScriptRoot/actions.ps1"
+            . "$ScriptRoot/graph.ps1"
+            $result = Invoke-GraphSearch -Query $Query -Name $Name
+            $result['job_id'] = $JobId
+            $result['finished'] = (Get-Date).ToUniversalTime().ToString('o')
+            $Jobs[$JobId] = $result
+        }
+        catch {
+            $Jobs[$JobId] = @{
+                job_id   = $JobId
+                status   = 'failed'
+                query    = $Query
+                error    = $_.Exception.Message
+                detail   = ($_.Exception.ToString() -split "`n" | Select-Object -First 10) -join ' | '
+                finished = (Get-Date).ToUniversalTime().ToString('o')
+            }
+        }
+    }).AddArgument($PSScriptRoot).AddArgument($script:Jobs).AddArgument($jobId).AddArgument($Query).AddArgument($Name) | Out-Null
+
+    [void]$ps.BeginInvoke()
+    return $script:Jobs[$jobId]
+}
+
 $listener = [System.Net.HttpListener]::new()
 $listener.Prefixes.Add("http://+:$Port/")
 $listener.Start()
@@ -74,6 +135,8 @@ while ($listener.IsListening) {
                 app_id       = if ($env:EXO_APP_ID) { 'set' } else { 'missing' }
                 organization = if ($env:EXO_ORGANIZATION) { $env:EXO_ORGANIZATION } else { 'missing' }
                 certificate  = if ($env:EXO_CERT_PATH -and (Test-Path $env:EXO_CERT_PATH)) { 'present' } else { 'missing' }
+                jobs_total   = $script:Jobs.Count
+                jobs_running = @($script:Jobs.Values | Where-Object { $_['status'] -eq 'running' }).Count
             }
             continue
         }
@@ -106,7 +169,26 @@ while ($listener.IsListening) {
 
             'POST /search' {
                 if (-not $body['query']) { Write-Json $response @{ error = 'query (KQL) is required' } 400; break }
-                Write-Json $response (Invoke-GraphSearch -Query $body['query'] -Name $body['name'])
+                $job = Start-SearchJob -Query $body['query'] -Name $body['name']
+                Write-Json $response $job 202
+                break
+            }
+
+            'GET /search-status' {
+                $jobId = $request.QueryString['job_id']
+                if (-not $jobId) { Write-Json $response @{ error = 'job_id is required' } 400; break }
+                if (-not $script:Jobs.ContainsKey($jobId)) {
+                    # Jobs are in memory only, so a restart loses them. Say that
+                    # rather than let a caller read 404 as "still running".
+                    Write-Json $response @{ error = 'unknown job_id (jobs do not survive a worker restart)'; job_id = $jobId } 404
+                    break
+                }
+                Write-Json $response $script:Jobs[$jobId]
+                break
+            }
+
+            'GET /searches' {
+                Write-Json $response @{ action = 'list_jobs'; count = $script:Jobs.Count; jobs = @($script:Jobs.Values) }
                 break
             }
 
@@ -125,9 +207,12 @@ while ($listener.IsListening) {
             }
 
             'GET /purge-status' {
-                $name = $request.QueryString['action_name']
-                if (-not $name) { Write-Json $response @{ error = 'action_name is required' } 400; break }
-                Write-Json $response (Get-PurgeStatus -ActionName $name)
+                $caseId = $request.QueryString['case_id']
+                $opId = $request.QueryString['operation_id']
+                if (-not $caseId -or -not $opId) {
+                    Write-Json $response @{ error = 'case_id and operation_id are required (both returned by /purge)' } 400; break
+                }
+                Write-Json $response (Get-GraphPurgeStatus -CaseId $caseId -OperationId $opId)
                 break
             }
 
