@@ -64,35 +64,45 @@ function Test-Auth {
 # /search-status. The request thread then never blocks for more than a moment.
 
 $script:Jobs = [hashtable]::Synchronized(@{})
-$script:Pool = [runspacefactory]::CreateRunspacePool(1, 4)
+# 8 rather than 4: a per-mailbox fan-out over a handful of named recipients
+# plus the tenant-wide sweep should all run at once, not queue behind each other.
+$script:Pool = [runspacefactory]::CreateRunspacePool(1, 8)
 $script:Pool.Open()
 
 function Start-SearchJob {
     param(
         [Parameter(Mandatory)][string]$Query,
-        [string]$Name
+        [string]$Name,
+        [string[]]$Mailboxes
     )
 
     $jobId = [guid]::NewGuid().ToString('N').Substring(0, 16)
     $script:Jobs[$jobId] = @{
-        job_id  = $jobId
-        status  = 'running'
-        query   = $Query
-        name    = $Name
-        started = (Get-Date).ToUniversalTime().ToString('o')
+        job_id    = $jobId
+        status    = 'running'
+        query     = $Query
+        name      = $Name
+        scope     = if ($Mailboxes -and $Mailboxes.Count -gt 0) { 'mailboxes' } else { 'all_tenant_mailboxes' }
+        mailboxes = @($Mailboxes)
+        started   = (Get-Date).ToUniversalTime().ToString('o')
     }
 
     $ps = [powershell]::Create()
     $ps.RunspacePool = $script:Pool
     [void]$ps.AddScript({
-        param($ScriptRoot, $Jobs, $JobId, $Query, $Name)
+        param($ScriptRoot, $Jobs, $JobId, $Query, $Name, $Mailboxes)
         # A fresh runspace shares no state with the server, so the modules have
         # to be dot-sourced again. Environment variables are process-wide and
         # come across on their own.
         try {
             . "$ScriptRoot/actions.ps1"
             . "$ScriptRoot/graph.ps1"
-            $result = Invoke-GraphSearch -Query $Query -Name $Name
+            $result = if ($Mailboxes -and $Mailboxes.Count -gt 0) {
+                Invoke-GraphSearch -Query $Query -Name $Name -Mailboxes $Mailboxes
+            }
+            else {
+                Invoke-GraphSearch -Query $Query -Name $Name
+            }
             $result['job_id'] = $JobId
             $result['finished'] = (Get-Date).ToUniversalTime().ToString('o')
             $Jobs[$JobId] = $result
@@ -107,7 +117,7 @@ function Start-SearchJob {
                 finished = (Get-Date).ToUniversalTime().ToString('o')
             }
         }
-    }).AddArgument($PSScriptRoot).AddArgument($script:Jobs).AddArgument($jobId).AddArgument($Query).AddArgument($Name) | Out-Null
+    }).AddArgument($PSScriptRoot).AddArgument($script:Jobs).AddArgument($jobId).AddArgument($Query).AddArgument($Name).AddArgument($Mailboxes) | Out-Null
 
     [void]$ps.BeginInvoke()
     return $script:Jobs[$jobId]
@@ -169,7 +179,11 @@ while ($listener.IsListening) {
 
             'POST /search' {
                 if (-not $body['query']) { Write-Json $response @{ error = 'query (KQL) is required' } 400; break }
-                $job = Start-SearchJob -Query $body['query'] -Name $body['name']
+                # Omit mailboxes for the tenant-wide sweep. Pass one address to
+                # learn whether that specific mailbox holds the message --
+                # estimateStatistics never names the mailboxes it counted.
+                $mbx = if ($body['mailboxes']) { [string[]]$body['mailboxes'] } else { @() }
+                $job = Start-SearchJob -Query $body['query'] -Name $body['name'] -Mailboxes $mbx
                 Write-Json $response $job 202
                 break
             }

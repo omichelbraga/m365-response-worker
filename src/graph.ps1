@@ -138,6 +138,16 @@ function Invoke-GraphSearch {
     param(
         [Parameter(Mandatory)][string]$Query,
         [string]$Name,
+        # Scope to named mailboxes instead of the whole tenant. Estimate time
+        # scales with locations searched, so a handful of addresses returns in
+        # under a minute against 730 s tenant-wide.
+        #
+        # Faster, but strictly less complete: it can only find mail in mailboxes
+        # somebody already named. Use it to break a known set down per mailbox
+        # -- which is the only way to learn WHICH mailbox a hit is in, since
+        # estimateStatistics reports a mailboxCount and no names -- not as a
+        # substitute for the tenant-wide sweep that catches the rest.
+        [string[]]$Mailboxes,
         # A tenant-wide estimate for a single sender over eight days was measured
         # at 730 s against this tenant, so the old 600 s ceiling failed every
         # real search a couple of minutes before Graph finished. Callers run this
@@ -147,11 +157,26 @@ function Invoke-GraphSearch {
 
     if (-not $Name) { $Name = "auto-$([guid]::NewGuid().ToString('N').Substring(0,12))" }
     $caseId = Get-WorkerCase
+    $scoped = ($Mailboxes -and $Mailboxes.Count -gt 0)
 
     $search = Invoke-Graph -Method POST -Path "/security/cases/ediscoveryCases/$caseId/searches" -Body @{
         displayName      = $Name
         contentQuery     = $Query
-        dataSourceScopes = 'allTenantMailboxes'
+        # 'none' plus explicit additionalSources is how a search is pinned to
+        # specific locations; the two are mutually exclusive.
+        dataSourceScopes = if ($scoped) { 'none' } else { 'allTenantMailboxes' }
+    }
+
+    if ($scoped) {
+        foreach ($mbx in $Mailboxes) {
+            Invoke-Graph -Method POST `
+                -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)/additionalSources" `
+                -Body @{
+                    '@odata.type'   = 'microsoft.graph.security.userSource'
+                    email           = $mbx
+                    includedSources = 'mailbox'
+                } | Out-Null
+        }
     }
 
     Invoke-Graph -Method POST `
@@ -177,6 +202,8 @@ function Invoke-GraphSearch {
         search_id     = $search.id
         search_name   = $Name
         query         = $Query
+        scope         = if ($scoped) { 'mailboxes' } else { 'all_tenant_mailboxes' }
+        mailboxes     = if ($scoped) { @($Mailboxes) } else { @() }
         total_items   = [int]$op.indexedItemCount
         total_size    = [int64]$op.indexedItemsSize
         mailbox_count = [int]$op.mailboxCount
