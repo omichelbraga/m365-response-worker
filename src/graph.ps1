@@ -104,8 +104,18 @@ function Invoke-Graph {
         $req['ContentType'] = 'application/json'
     }
 
-    if ($Raw) { return Invoke-WebRequest @req }
-    return Invoke-RestMethod @req
+    # Graph puts the actual complaint in the response body; the exception message
+    # is only "Response status code does not indicate success: 400". Losing the
+    # body turns every schema mistake into a guessing game, so re-throw with it.
+    try {
+        if ($Raw) { return Invoke-WebRequest @req }
+        return Invoke-RestMethod @req
+    }
+    catch {
+        $detail = $null
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $detail = $_.ErrorDetails.Message }
+        throw "Graph $Method $Path failed: $($_.Exception.Message) | body: $(if ($detail) { $detail } else { '(none)' })"
+    }
 }
 
 function Get-WorkerCase {
