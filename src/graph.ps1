@@ -169,31 +169,35 @@ function Invoke-GraphSearch {
     $caseId = Get-WorkerCase
     $scoped = ($Mailboxes -and $Mailboxes.Count -gt 0)
 
-    $createBody = @{
+    # Scoping to named mailboxes takes three calls, because the obvious one-shot
+    # forms are both rejected:
+    #
+    #   * creating with dataSourceScopes 'none' and no sources fails with
+    #     "At least one data source is required"
+    #   * additionalSources is a navigation property, so it cannot be set inline
+    #     on create -- it only accepts POSTs to its own collection
+    #
+    # So: create wide, narrow the sources, then patch the scope down. Nothing
+    # runs until estimateStatistics below, so the intermediate wide scope never
+    # actually searches anything.
+    $search = Invoke-Graph -Method POST -Path "/security/cases/ediscoveryCases/$caseId/searches" -Body @{
         displayName      = $Name
         contentQuery     = $Query
-        # 'none' plus explicit additionalSources is how a search is pinned to
-        # specific locations; the two are mutually exclusive.
-        dataSourceScopes = if ($scoped) { 'none' } else { 'allTenantMailboxes' }
+        dataSourceScopes = 'allTenantMailboxes'
     }
 
     if ($scoped) {
-        # The sources must be inline on create. POSTing them afterwards to the
-        # additionalSources collection is too late -- creating a search with
-        # scope 'none' and no sources is rejected outright with
-        # "At least one data source is required."
-        $createBody['additionalSources'] = @(
-            foreach ($mbx in $Mailboxes) {
-                @{
-                    '@odata.type'   = 'microsoft.graph.security.userSource'
-                    email           = $mbx
-                    includedSources = 'mailbox'
-                }
-            }
-        )
-    }
+        foreach ($mbx in $Mailboxes) {
+            # email only: includedSources is returned by Graph, not accepted.
+            Invoke-Graph -Method POST `
+                -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)/additionalSources" `
+                -Body @{ '@odata.type' = 'microsoft.graph.security.userSource'; email = $mbx } | Out-Null
+        }
 
-    $search = Invoke-Graph -Method POST -Path "/security/cases/ediscoveryCases/$caseId/searches" -Body $createBody
+        Invoke-Graph -Method PATCH `
+            -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)" `
+            -Body @{ dataSourceScopes = 'none' } | Out-Null
+    }
 
     Invoke-Graph -Method POST `
         -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)/estimateStatistics" | Out-Null
