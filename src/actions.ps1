@@ -153,9 +153,12 @@ function Invoke-BlockSender {
             }
             catch {
                 # An existing entry is not a failure for our purposes -- the desired
-                # end state (sender is blocked) already holds.
+                # end state (sender is blocked) already holds. Exchange words this
+                # inconsistently: "already exists" in some paths, "Duplicate value"
+                # in others. Matching only the first reported a re-run of an
+                # already-successful block as a failure.
                 $msg = $_.Exception.Message
-                $already = $msg -match 'already exist'
+                $already = $msg -match 'already exist|duplicate value|duplicate entry'
                 $results += [ordered]@{
                     sender = $sender
                     status = if ($already) { 'already_blocked' } else { 'failed' }
