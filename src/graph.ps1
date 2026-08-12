@@ -134,7 +134,12 @@ function Invoke-Graph {
                     try { $status = [int]$resp.StatusCode } catch { $status = 0 }
                 }
             }
-            $transient = ($status -in @(429, 500, 502, 503, 504))
+            # Status 0 means no HTTP response at all -- DNS, TLS or a dead
+            # socket. Those are transient far more often than not, and one of
+            # them ("Network is unreachable" when the resolver returns only AAAA
+            # records for graph.microsoft.com and the bridge is IPv4-only) failed
+            # a whole run. Retrying a connection failure costs nothing.
+            $transient = ($status -in @(429, 500, 502, 503, 504)) -or ($status -eq 0)
 
             if ($transient -and $attempt -lt $maxAttempts) {
                 $backoff = [Math]::Pow(2, $attempt) * 5
