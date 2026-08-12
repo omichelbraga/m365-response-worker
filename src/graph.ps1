@@ -213,49 +213,88 @@ function Invoke-GraphSearch {
     # So: create wide, narrow the sources, then patch the scope down. Nothing
     # runs until estimateStatistics below, so the intermediate wide scope never
     # actually searches anything.
-    # Deliberately NOT deleting existing searches with this name.
+    # REUSE a search with this name if one exists. Both alternatives are wrong:
     #
-    # An earlier version cleared same-named siblings before creating a new one,
-    # to stop re-runs piling up in the Purview UI. That silently invalidated
-    # every approval link already sitting in Teams: the card carries a search id,
-    # a later poll recreated the search with a NEW id, and the purge then failed
-    # 404 NotFound against a search that no longer existed. Tidy case list, dead
-    # approval links -- a bad trade.
+    #   * Deleting the old one first (an earlier version did this, to keep the
+    #     Purview case tidy) invalidates the search id already sitting in every
+    #     approval card in Teams. The purge then fails 404 NotFound. Two cases
+    #     had to be purged by hand because of it.
+    #   * Not deleting and creating anyway fails outright: Graph enforces unique
+    #     display names within a case and answers
+    #     409 Conflict "An entity with the same name already exists."
     #
-    # The half-built searches that motivated it are handled properly by the
-    # rollback below, and the poller's own dedupe keeps re-runs rare, so the
-    # duplicates barely accumulate.
-
-    $search = Invoke-Graph -Method POST -Path "/security/cases/ediscoveryCases/$caseId/searches" -Body @{
-        displayName      = $Name
-        contentQuery     = $Query
-        dataSourceScopes = 'allTenantMailboxes'
+    # Reusing keeps the id stable for the lifetime of the case, so an approval
+    # link never goes stale no matter how often the poller re-runs.
+    $existing = $null
+    try {
+        $all = Invoke-Graph -Method GET -Path "/security/cases/ediscoveryCases/$caseId/searches"
+        $existing = $all.value | Where-Object { $_.displayName -eq $Name } | Select-Object -First 1
+    }
+    catch {
+        Write-Host "Could not list existing searches, will try to create: $($_.Exception.Message)"
     }
 
-    # From here on the search exists. Anything that fails during setup must take
-    # it back out again, or a failed run leaves a query with no statistics
-    # sitting in the case looking like a real result.
+    $created = $false
+    if ($existing) {
+        $search = $existing
+        Write-Host "Reusing search '$Name' ($($search.id))"
+    }
+    else {
+        $search = Invoke-Graph -Method POST -Path "/security/cases/ediscoveryCases/$caseId/searches" -Body @{
+            displayName      = $Name
+            contentQuery     = $Query
+            dataSourceScopes = 'allTenantMailboxes'
+        }
+        $created = $true
+    }
+
     try {
+        # The received window ends "tomorrow", so the query differs on every run
+        # even when nothing else has changed. Refresh it on a reused search.
+        if (-not $created) {
+            Invoke-Graph -Method PATCH `
+                -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)" `
+                -Body @{ contentQuery = $Query } | Out-Null
+        }
+
         if ($scoped) {
+            # Add only what is missing. Sources are never removed: an extra
+            # mailbox left over from an earlier run simply returns no hits,
+            # whereas removing one risks dropping a recipient still in scope.
+            $have = @()
+            try {
+                $srcs = Invoke-Graph -Method GET `
+                    -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)/additionalSources"
+                foreach ($s in $srcs.value) { if ($s.email) { $have += $s.email.ToLower() } }
+            }
+            catch { $have = @() }
+
             foreach ($mbx in $Mailboxes) {
+                if ($have -contains $mbx.ToLower()) { continue }
                 # email only: includedSources is returned by Graph, not accepted.
                 Invoke-Graph -Method POST `
                     -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)/additionalSources" `
                     -Body @{ '@odata.type' = 'microsoft.graph.security.userSource'; email = $mbx } | Out-Null
             }
-
-            Invoke-Graph -Method PATCH `
-                -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)" `
-                -Body @{ dataSourceScopes = 'none' } | Out-Null
         }
+
+        # Set the scope last: 'none' is only legal once sources exist.
+        Invoke-Graph -Method PATCH `
+            -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)" `
+            -Body @{ dataSourceScopes = $(if ($scoped) { 'none' } else { 'allTenantMailboxes' }) } | Out-Null
     }
     catch {
         $setupError = $_
-        try {
-            Invoke-Graph -Method DELETE -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)" | Out-Null
-            Write-Host "Rolled back partially built search '$Name'"
+        # Only roll back a search WE created this run. Deleting a reused one
+        # would destroy the id every existing approval card points at -- the
+        # exact failure this whole block exists to prevent.
+        if ($created) {
+            try {
+                Invoke-Graph -Method DELETE -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)" | Out-Null
+                Write-Host "Rolled back partially built search '$Name'"
+            }
+            catch { Write-Host "Could not roll back search '$Name': $($_.Exception.Message)" }
         }
-        catch { Write-Host "Could not roll back search '$Name': $($_.Exception.Message)" }
         throw $setupError
     }
 
