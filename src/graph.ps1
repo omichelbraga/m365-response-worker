@@ -213,21 +213,18 @@ function Invoke-GraphSearch {
     # So: create wide, narrow the sources, then patch the scope down. Nothing
     # runs until estimateStatistics below, so the intermediate wide scope never
     # actually searches anything.
-    # Searches are named after the eSentire case, so a re-run would otherwise pile
-    # up identically-named siblings -- including half-built ones from failed
-    # attempts, which show an empty Statistics tab and are indistinguishable in
-    # the Purview UI from the real thing. Clear the old ones first.
-    try {
-        $existing = Invoke-Graph -Method GET -Path "/security/cases/ediscoveryCases/$caseId/searches"
-        foreach ($old in ($existing.value | Where-Object { $_.displayName -eq $Name })) {
-            Write-Host "Removing previous search '$Name' ($($old.id))"
-            Invoke-Graph -Method DELETE -Path "/security/cases/ediscoveryCases/$caseId/searches/$($old.id)" | Out-Null
-        }
-    }
-    catch {
-        # Housekeeping only -- never let it stop the search we were asked for.
-        Write-Host "Could not clear previous '$Name' searches: $($_.Exception.Message)"
-    }
+    # Deliberately NOT deleting existing searches with this name.
+    #
+    # An earlier version cleared same-named siblings before creating a new one,
+    # to stop re-runs piling up in the Purview UI. That silently invalidated
+    # every approval link already sitting in Teams: the card carries a search id,
+    # a later poll recreated the search with a NEW id, and the purge then failed
+    # 404 NotFound against a search that no longer existed. Tidy case list, dead
+    # approval links -- a bad trade.
+    #
+    # The half-built searches that motivated it are handled properly by the
+    # rollback below, and the poller's own dedupe keeps re-runs rare, so the
+    # duplicates barely accumulate.
 
     $search = Invoke-Graph -Method POST -Path "/security/cases/ediscoveryCases/$caseId/searches" -Body @{
         displayName      = $Name
