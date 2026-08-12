@@ -121,8 +121,19 @@ function Invoke-Graph {
             return Invoke-RestMethod @req
         }
         catch {
+            $err = $_
             $status = 0
-            if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+            # StrictMode turns a read of a missing property into a throw, and not
+            # every exception reaching here is an HttpResponseException. Probing
+            # first matters because a crash inside the error handler destroys the
+            # error it was meant to report -- that is how a Graph 400 surfaced as
+            # "The property 'Response' cannot be found on this object."
+            if ($err.Exception.PSObject.Properties.Name -contains 'Response') {
+                $resp = $err.Exception.Response
+                if ($resp) {
+                    try { $status = [int]$resp.StatusCode } catch { $status = 0 }
+                }
+            }
             $transient = ($status -in @(429, 500, 502, 503, 504))
 
             if ($transient -and $attempt -lt $maxAttempts) {
@@ -133,9 +144,9 @@ function Invoke-Graph {
             }
 
             $detail = $null
-            if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $detail = $_.ErrorDetails.Message }
+            if ($err.ErrorDetails -and $err.ErrorDetails.Message) { $detail = $err.ErrorDetails.Message }
             $suffix = if ($transient) { " after $attempt attempts" } else { '' }
-            throw "Graph $Method $Path failed$suffix (HTTP $status): $($_.Exception.Message) | body: $(if ($detail) { $detail } else { '(none)' })"
+            throw "Graph $Method $Path failed$suffix (HTTP $status): $($err.Exception.Message) | body: $(if ($detail) { $detail } else { '(none)' })"
         }
     }
 }
@@ -202,23 +213,53 @@ function Invoke-GraphSearch {
     # So: create wide, narrow the sources, then patch the scope down. Nothing
     # runs until estimateStatistics below, so the intermediate wide scope never
     # actually searches anything.
+    # Searches are named after the eSentire case, so a re-run would otherwise pile
+    # up identically-named siblings -- including half-built ones from failed
+    # attempts, which show an empty Statistics tab and are indistinguishable in
+    # the Purview UI from the real thing. Clear the old ones first.
+    try {
+        $existing = Invoke-Graph -Method GET -Path "/security/cases/ediscoveryCases/$caseId/searches"
+        foreach ($old in ($existing.value | Where-Object { $_.displayName -eq $Name })) {
+            Write-Host "Removing previous search '$Name' ($($old.id))"
+            Invoke-Graph -Method DELETE -Path "/security/cases/ediscoveryCases/$caseId/searches/$($old.id)" | Out-Null
+        }
+    }
+    catch {
+        # Housekeeping only -- never let it stop the search we were asked for.
+        Write-Host "Could not clear previous '$Name' searches: $($_.Exception.Message)"
+    }
+
     $search = Invoke-Graph -Method POST -Path "/security/cases/ediscoveryCases/$caseId/searches" -Body @{
         displayName      = $Name
         contentQuery     = $Query
         dataSourceScopes = 'allTenantMailboxes'
     }
 
-    if ($scoped) {
-        foreach ($mbx in $Mailboxes) {
-            # email only: includedSources is returned by Graph, not accepted.
-            Invoke-Graph -Method POST `
-                -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)/additionalSources" `
-                -Body @{ '@odata.type' = 'microsoft.graph.security.userSource'; email = $mbx } | Out-Null
-        }
+    # From here on the search exists. Anything that fails during setup must take
+    # it back out again, or a failed run leaves a query with no statistics
+    # sitting in the case looking like a real result.
+    try {
+        if ($scoped) {
+            foreach ($mbx in $Mailboxes) {
+                # email only: includedSources is returned by Graph, not accepted.
+                Invoke-Graph -Method POST `
+                    -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)/additionalSources" `
+                    -Body @{ '@odata.type' = 'microsoft.graph.security.userSource'; email = $mbx } | Out-Null
+            }
 
-        Invoke-Graph -Method PATCH `
-            -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)" `
-            -Body @{ dataSourceScopes = 'none' } | Out-Null
+            Invoke-Graph -Method PATCH `
+                -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)" `
+                -Body @{ dataSourceScopes = 'none' } | Out-Null
+        }
+    }
+    catch {
+        $setupError = $_
+        try {
+            Invoke-Graph -Method DELETE -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)" | Out-Null
+            Write-Host "Rolled back partially built search '$Name'"
+        }
+        catch { Write-Host "Could not roll back search '$Name': $($_.Exception.Message)" }
+        throw $setupError
     }
 
     Invoke-Graph -Method POST `
