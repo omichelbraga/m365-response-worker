@@ -240,6 +240,7 @@ function Invoke-GraphSearch {
     }
 
     $created = $false
+    $unresolved = @()
     if ($existing) {
         $search = $existing
         Write-Host "Reusing search '$Name' ($($search.id))"
@@ -276,17 +277,37 @@ function Invoke-GraphSearch {
 
             foreach ($mbx in $Mailboxes) {
                 if ($have -contains $mbx.ToLower()) { continue }
-                # email only: includedSources is returned by Graph, not accepted.
-                Invoke-Graph -Method POST `
-                    -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)/additionalSources" `
-                    -Body @{ '@odata.type' = 'microsoft.graph.security.userSource'; email = $mbx } | Out-Null
+                try {
+                    # email only: includedSources is returned by Graph, not accepted.
+                    Invoke-Graph -Method POST `
+                        -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)/additionalSources" `
+                        -Body @{ '@odata.type' = 'microsoft.graph.security.userSource'; email = $mbx } | Out-Null
+                    $have += $mbx.ToLower()
+                }
+                catch {
+                    # One unresolvable address must not take the whole search
+                    # down. Recipients are harvested from the case narrative as
+                    # well as from Entities, so the odd one is a distribution
+                    # list, a departed user, or simply not a mailbox -- Graph
+                    # answers 400 "User not found." and, before this, aborted
+                    # everything including the mailboxes that were perfectly fine.
+                    Write-Host "Skipping unresolvable mailbox '$mbx': $($_.Exception.Message)"
+                    $unresolved += $mbx
+                }
             }
         }
 
-        # Set the scope last: 'none' is only legal once sources exist.
+        # 'none' is only legal once at least one source exists. If not a single
+        # named mailbox resolved, fall back to a tenant-wide sweep rather than
+        # failing outright -- slower, but it still answers the question.
+        $haveAny = ($have.Count -gt 0)
+        $effectiveScoped = ($scoped -and $haveAny)
+        if ($scoped -and -not $haveAny) {
+            Write-Host "No named mailbox resolved; falling back to a tenant-wide search"
+        }
         Invoke-Graph -Method PATCH `
             -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)" `
-            -Body @{ dataSourceScopes = $(if ($scoped) { 'none' } else { 'allTenantMailboxes' }) } | Out-Null
+            -Body @{ dataSourceScopes = $(if ($effectiveScoped) { 'none' } else { 'allTenantMailboxes' }) } | Out-Null
     }
     catch {
         $setupError = $_
@@ -326,8 +347,9 @@ function Invoke-GraphSearch {
         search_id     = $search.id
         search_name   = $Name
         query         = $Query
-        scope         = if ($scoped) { 'mailboxes' } else { 'all_tenant_mailboxes' }
+        scope         = if ($scoped -and $unresolved.Count -lt $Mailboxes.Count) { 'mailboxes' } else { 'all_tenant_mailboxes' }
         mailboxes     = if ($scoped) { @($Mailboxes) } else { @() }
+        unresolved    = @($unresolved)
         total_items   = [int]$op.indexedItemCount
         total_size    = [int64]$op.indexedItemsSize
         mailbox_count = [int]$op.mailboxCount
