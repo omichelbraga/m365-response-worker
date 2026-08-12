@@ -107,14 +107,36 @@ function Invoke-Graph {
     # Graph puts the actual complaint in the response body; the exception message
     # is only "Response status code does not indicate success: 400". Losing the
     # body turns every schema mistake into a guessing game, so re-throw with it.
-    try {
-        if ($Raw) { return Invoke-WebRequest @req }
-        return Invoke-RestMethod @req
-    }
-    catch {
-        $detail = $null
-        if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $detail = $_.ErrorDetails.Message }
-        throw "Graph $Method $Path failed: $($_.Exception.Message) | body: $(if ($detail) { $detail } else { '(none)' })"
+    #
+    # 502/503/504 come from Azure's front door rather than Graph itself and are
+    # routinely transient -- a 504 creating a search failed an entire poll run
+    # once. Retry those and 429; never retry a 4xx, which would just repeat a
+    # request Graph has already rejected on its merits.
+    $attempt = 0
+    $maxAttempts = 4
+    while ($true) {
+        $attempt++
+        try {
+            if ($Raw) { return Invoke-WebRequest @req }
+            return Invoke-RestMethod @req
+        }
+        catch {
+            $status = 0
+            if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+            $transient = ($status -in @(429, 500, 502, 503, 504))
+
+            if ($transient -and $attempt -lt $maxAttempts) {
+                $backoff = [Math]::Pow(2, $attempt) * 5
+                Write-Host "Graph $Method $Path -> $status, retry $attempt/$($maxAttempts - 1) in ${backoff}s"
+                Start-Sleep -Seconds $backoff
+                continue
+            }
+
+            $detail = $null
+            if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $detail = $_.ErrorDetails.Message }
+            $suffix = if ($transient) { " after $attempt attempts" } else { '' }
+            throw "Graph $Method $Path failed$suffix (HTTP $status): $($_.Exception.Message) | body: $(if ($detail) { $detail } else { '(none)' })"
+        }
     }
 }
 

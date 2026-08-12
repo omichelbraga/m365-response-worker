@@ -108,13 +108,19 @@ function Start-SearchJob {
             $Jobs[$JobId] = $result
         }
         catch {
+            # Keep `name` on the failure too. Callers correlate a job back to the
+            # work that requested it by search name; without it a failed job is
+            # an orphan and gets silently dropped downstream.
             $Jobs[$JobId] = @{
-                job_id   = $JobId
-                status   = 'failed'
-                query    = $Query
-                error    = $_.Exception.Message
-                detail   = ($_.Exception.ToString() -split "`n" | Select-Object -First 10) -join ' | '
-                finished = (Get-Date).ToUniversalTime().ToString('o')
+                job_id      = $JobId
+                status      = 'failed'
+                query       = $Query
+                name        = $Name
+                search_name = $Name
+                mailboxes   = @($Mailboxes)
+                error       = $_.Exception.Message
+                detail      = ($_.Exception.ToString() -split "`n" | Select-Object -First 10) -join ' | '
+                finished    = (Get-Date).ToUniversalTime().ToString('o')
             }
         }
     }).AddArgument($PSScriptRoot).AddArgument($script:Jobs).AddArgument($jobId).AddArgument($Query).AddArgument($Name).AddArgument($Mailboxes) | Out-Null
