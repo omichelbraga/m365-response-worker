@@ -263,11 +263,17 @@ function Invoke-GraphSearch {
                 -Body @{ contentQuery = $Query } | Out-Null
         }
 
+        # Declared out here rather than inside the scoped branch: $haveAny below
+        # reads it unconditionally, so under StrictMode a tenant-wide search --
+        # which skips that branch entirely -- died on the unset variable. Scoped
+        # searches always set it, which is why this hid until the first real
+        # tenant-wide call.
+        $have = @()
+
         if ($scoped) {
             # Add only what is missing. Sources are never removed: an extra
             # mailbox left over from an earlier run simply returns no hits,
             # whereas removing one risks dropping a recipient still in scope.
-            $have = @()
             try {
                 $srcs = Invoke-Graph -Method GET `
                     -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)/additionalSources"
