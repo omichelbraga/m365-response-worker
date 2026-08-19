@@ -245,14 +245,26 @@ function Invoke-GraphSearch {
     }
 
     $created = $false
+    $rebuilt = $false
     $unresolved = @()
     # Mailboxes that exist but are INACTIVE. They cannot be used as a scoped
     # source without corrupting the estimate, and a scoped search cannot see
     # their contents at all -- only a tenant-wide sweep can.
     $inactive = @()
+    # The scope a reused search was BUILT with. Changing it later does not work:
+    # Graph binds a search to its committed source collection, and flipping
+    # dataSourceScopes afterwards leaves the properties looking right while the
+    # search keeps answering from the old collection. Measured: a search built
+    # scoped, then stripped of sources and set to allTenantMailboxes, reported 0
+    # items and verified_clean=true while a freshly created search with the same
+    # query found 5 and the message was still sitting in four mailboxes. A false
+    # clean is worse than no verification at all, so if the scope has to change,
+    # the search is rebuilt rather than repurposed.
+    $originalScopes = $null
     if ($existing) {
         $search = $existing
-        Write-Host "Reusing search '$Name' ($($search.id))"
+        $originalScopes = $existing.dataSourceScopes
+        Write-Host "Reusing search '$Name' ($($search.id)), built with dataSourceScopes '$originalScopes'"
     }
     else {
         $search = Invoke-Graph -Method POST -Path "/security/cases/ediscoveryCases/$caseId/searches" -Body @{
@@ -404,9 +416,42 @@ function Invoke-GraphSearch {
             $scopeReason = 'tenant-wide: not one named mailbox resolved'
             Write-Host $scopeReason
         }
+        $wantScopes = if ($effectiveScoped) { 'none' } else { 'allTenantMailboxes' }
+
+        # Rebuild rather than repurpose when a reused search was built with a
+        # different scope. Deleting invalidates the search id in any approval
+        # card already sitting in Teams -- a purge from one of those then fails
+        # 404, which is loud. A search that silently reports 0 because it is
+        # still answering from a stale source collection is not loud, and it is
+        # what closes a case as remediated while the mail is still there.
+        if (-not $created -and $originalScopes -and $originalScopes -ne $wantScopes) {
+            Write-Host "Search '$Name' was built as '$originalScopes' but needs '$wantScopes'; rebuilding it"
+            Invoke-Graph -Method DELETE -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)" | Out-Null
+            $search = Invoke-Graph -Method POST -Path "/security/cases/ediscoveryCases/$caseId/searches" -Body @{
+                displayName      = $Name
+                contentQuery     = $Query
+                dataSourceScopes = 'allTenantMailboxes'
+            }
+            $created = $true
+            $rebuilt = $true
+
+            if ($effectiveScoped) {
+                # Re-add the sources we established are safe (inactive ones are
+                # already excluded from $have).
+                foreach ($mbx in $have) {
+                    try {
+                        Invoke-Graph -Method POST `
+                            -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)/additionalSources" `
+                            -Body @{ '@odata.type' = 'microsoft.graph.security.userSource'; email = $mbx } | Out-Null
+                    }
+                    catch { Write-Host "Could not re-add source '$mbx' after rebuild: $($_.Exception.Message)" }
+                }
+            }
+        }
+
         Invoke-Graph -Method PATCH `
             -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)" `
-            -Body @{ dataSourceScopes = $(if ($effectiveScoped) { 'none' } else { 'allTenantMailboxes' }) } | Out-Null
+            -Body @{ dataSourceScopes = $wantScopes } | Out-Null
     }
     catch {
         $setupError = $_
@@ -452,6 +497,7 @@ function Invoke-GraphSearch {
         # the one it ran.
         scope         = if ($effectiveScoped) { 'mailboxes' } else { 'all_tenant_mailboxes' }
         scope_reason  = $scopeReason
+        rebuilt       = $rebuilt
         mailboxes     = if ($scoped) { @($Mailboxes) } else { @() }
         searched      = @($have)
         unresolved    = @($unresolved)
