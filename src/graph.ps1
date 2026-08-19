@@ -297,25 +297,55 @@ function Invoke-GraphSearch {
         $tooMany = ($scoped -and $Mailboxes.Count -gt $TenantWideThreshold)
 
         if ($scoped -and -not $tooMany) {
-            # Add only what is missing. Sources are never removed: an extra
-            # mailbox left over from an earlier run simply returns no hits,
-            # whereas removing one risks dropping a recipient still in scope.
-            # The ONE exception is an inactive mailbox -- see below.
+            # ASK EXCHANGE FIRST. Two facts are only knowable here, and getting
+            # either wrong silently wrecks the search:
+            #
+            #  * PRIMARY SMTP. eDiscovery userSource rejects proxy addresses with
+            #    "User not found" even when the mailbox is real and active.
+            #    dnorris@san-marcos.net was refused all night; it is a proxy for
+            #    DGordon@sanmarcosca.gov, an ordinary active mailbox. eSentire
+            #    reports @san-marcos.net addresses while this tenant's primaries
+            #    are @sanmarcosca.gov, so nearly every recipient needs resolving.
+            #
+            #  * INACTIVE. One inactive mailbox among the sources collapses the
+            #    estimate for EVERY other mailbox in the same search -- four
+            #    active mailboxes holding one message each estimated as 1. It was
+            #    previously detected by creating the source and reading the
+            #    displayName back, i.e. only after the damage was done.
+            $state = $null
+            try { $state = Test-MailboxState -Mailboxes $Mailboxes }
+            catch { Write-Host "Mailbox pre-check failed, falling back to raw addresses: $($_.Exception.Message)" }
+
+            $wanted = @()
+            if ($state) {
+                foreach ($r in $state.results) {
+                    if (-not $r.exists) { $unresolved += $r.email; continue }
+                    if ($r.inactive) { $inactive += $r.email; continue }
+                    $addr = if ($r.primary) { [string]$r.primary } else { [string]$r.email }
+                    if ($addr -and ($wanted -notcontains $addr.ToLower())) { $wanted += $addr.ToLower() }
+                }
+                if ($unresolved.Count) { Write-Host "Not mailboxes, skipped: $($unresolved -join ', ')" }
+                if ($inactive.Count) { Write-Host "Inactive mailboxes, skipped: $($inactive -join ', ')" }
+            }
+            else {
+                $wanted = @($Mailboxes | ForEach-Object { $_.ToLower() })
+            }
+
             try {
                 $srcs = Invoke-Graph -Method GET `
                     -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)/additionalSources"
                 foreach ($s in $srcs.value) {
                     if (-not $s.email) { continue }
+                    # A reused search can carry an inactive source from an earlier
+                    # run and stay poisoned indefinitely.
                     if ($s.displayName -match '\(Inactive Mailbox\)') {
-                        # A REUSED search can already carry one from an earlier run,
-                        # and it poisons every estimate until removed.
                         Write-Host "Removing inactive mailbox source '$($s.email)' from reused search"
                         try {
                             Invoke-Graph -Method DELETE `
                                 -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)/additionalSources/$($s.id)" | Out-Null
                         }
                         catch { Write-Host "Could not remove inactive source '$($s.email)': $($_.Exception.Message)" }
-                        $inactive += $s.email
+                        if ($inactive -notcontains $s.email) { $inactive += $s.email }
                         continue
                     }
                     $have += $s.email.ToLower()
@@ -323,47 +353,19 @@ function Invoke-GraphSearch {
             }
             catch { $have = @() }
 
-            foreach ($mbx in $Mailboxes) {
-                if ($have -contains $mbx.ToLower()) { continue }
-                if ($inactive -contains $mbx) { continue }
+            foreach ($mbx in $wanted) {
+                if ($have -contains $mbx) { continue }
                 try {
                     # email only: includedSources is returned by Graph, not accepted.
-                    $src = Invoke-Graph -Method POST `
+                    Invoke-Graph -Method POST `
                         -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)/additionalSources" `
-                        -Body @{ '@odata.type' = 'microsoft.graph.security.userSource'; email = $mbx }
-
-                    # ONE inactive mailbox in the source list collapses the WHOLE
-                    # estimate to a single item -- not just its own contribution.
-                    # Measured directly: four active mailboxes holding one message
-                    # each estimate as 4; add one inactive mailbox and the same
-                    # search estimates as 1. The purge then clears only what the
-                    # search can see, so CS5016743 reported "1 message in 1
-                    # mailbox", purged one copy, and left four behind while
-                    # reporting success.
-                    #
-                    # Graph only reveals it in the displayName it returns, so the
-                    # source has to be created before it can be recognised. Drop it
-                    # and record it: the caller escalates to a tenant-wide search,
-                    # which CAN see inactive mailboxes.
-                    if ($src.displayName -match '\(Inactive Mailbox\)') {
-                        Write-Host "Mailbox '$mbx' is an inactive mailbox; removing it as a source and flagging for tenant-wide"
-                        try {
-                            Invoke-Graph -Method DELETE `
-                                -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)/additionalSources/$($src.id)" | Out-Null
-                        }
-                        catch { Write-Host "Could not remove inactive source '$mbx': $($_.Exception.Message)" }
-                        $inactive += $mbx
-                        continue
-                    }
-                    $have += $mbx.ToLower()
+                        -Body @{ '@odata.type' = 'microsoft.graph.security.userSource'; email = $mbx } | Out-Null
+                    $have += $mbx
                 }
                 catch {
-                    # One unresolvable address must not take the whole search
-                    # down. Recipients are harvested from the case narrative as
-                    # well as from Entities, so the odd one is a distribution
-                    # list, a departed user, or simply not a mailbox -- Graph
-                    # answers 400 "User not found." and, before this, aborted
-                    # everything including the mailboxes that were perfectly fine.
+                    # Should be rare now the pre-check runs, but a mailbox can
+                    # still be refused. One bad address must not take down the
+                    # mailboxes that were perfectly fine.
                     Write-Host "Skipping unresolvable mailbox '$mbx': $($_.Exception.Message)"
                     $unresolved += $mbx
                 }
@@ -376,8 +378,13 @@ function Invoke-GraphSearch {
         # estimate that read "1 message in 1 mailbox" while four mailboxes held
         # the phish is what this guards against.
         $haveAny = ($have.Count -gt 0)
-        $hasInactive = ($inactive.Count -gt 0)
-        $effectiveScoped = ($scoped -and $haveAny -and -not $hasInactive -and -not $tooMany)
+        # An inactive mailbox no longer forces tenant-wide. It is excluded from the
+        # sources by the pre-check, so it can no longer corrupt the estimate, and
+        # escalating a five-recipient case to a tenant-wide sweep to reach one
+        # departed user's mailbox costs ~25 minutes and a tenant-wide purge for a
+        # mailbox nobody reads. It is reported on the card as not searched instead.
+        # Tenant-wide stays reserved for the recipient-count threshold.
+        $effectiveScoped = ($scoped -and $haveAny -and -not $tooMany)
 
         # A tenant-wide search must have NO sources. Setting dataSourceScopes to
         # allTenantMailboxes while additionalSources remain does NOT widen the
@@ -404,10 +411,6 @@ function Invoke-GraphSearch {
 
         $scopeReason = 'scoped to the named mailboxes'
         if (-not $scoped) { $scopeReason = 'no mailboxes named; tenant-wide' }
-        elseif ($hasInactive) {
-            $scopeReason = "tenant-wide: $($inactive.Count) inactive mailbox(es) in scope ($($inactive -join ', ')) - a scoped search cannot see them and one of them corrupts the whole estimate"
-            Write-Host $scopeReason
-        }
         elseif ($tooMany) {
             $scopeReason = "tenant-wide: $($Mailboxes.Count) recipients exceeds the scoping threshold of $TenantWideThreshold"
             Write-Host $scopeReason
