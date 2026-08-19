@@ -145,6 +145,21 @@ function Test-MailboxState {
                 $rec.searchable = -not $rec.inactive
                 $rec.display = $m.DisplayName
                 $rec.type = "$($m.RecipientTypeDetails)"
+                $rec.primary = "$($m.PrimarySmtpAddress)"
+                # HOLDS. A purge cannot permanently remove content from a mailbox
+                # under hold: the item is moved to Recoverable Items\Purges and
+                # retained for compliance, where eDiscovery STILL FINDS IT. So a
+                # post-purge estimate never reaches zero on a held mailbox, and a
+                # verification that demands zero can never pass. That is not a
+                # failed purge - the user cannot see the message - but it is
+                # indistinguishable from one if you only look at the count.
+                $rec.litigation_hold = [bool]$m.LitigationHoldEnabled
+                $rec.delay_hold = [bool]$m.DelayHoldApplied
+                $rec.delay_release_hold = [bool]$m.DelayReleaseHoldApplied
+                $rec.compliance_tag_hold = [bool]$m.ComplianceTagHoldApplied
+                $rec.in_place_holds = @($m.InPlaceHolds)
+                $rec.retention_policy = "$($m.RetentionPolicy)"
+                $rec.on_hold = ($rec.litigation_hold -or $rec.delay_hold -or $rec.delay_release_hold -or $rec.compliance_tag_hold -or (@($m.InPlaceHolds).Count -gt 0))
             }
             catch {
                 # Not a mailbox at all: a distribution list, an alias that does
