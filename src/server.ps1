@@ -120,7 +120,18 @@ function Start-VerifyJob {
                 finished       = (Get-Date).ToUniversalTime().ToString('o')
             }
         }
-    }).AddArgument($PSScriptRoot).AddArgument($script:Jobs).AddArgument($jobId).AddArgument($CaseId).AddArgument($SearchId) | Out-Null
+    # Bound by NAME, not position. A positional chain here silently delivered
+    # $null for CaseId -- the job failed 38 ms in with "Cannot bind argument to
+    # parameter 'CaseId' because it is an empty string" while the 202 response,
+    # built from the same variable a line earlier, carried the correct value.
+    # Name binding cannot shift or drop.
+    }).AddParameters(@{
+        ScriptRoot = $PSScriptRoot
+        Jobs       = $script:Jobs
+        JobId      = $jobId
+        CaseId     = $CaseId
+        SearchId   = $SearchId
+    }) | Out-Null
 
     [void]$ps.BeginInvoke()
     return $script:Jobs[$jobId]
