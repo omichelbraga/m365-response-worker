@@ -69,6 +69,63 @@ $script:Jobs = [hashtable]::Synchronized(@{})
 $script:Pool = [runspacefactory]::CreateRunspacePool(1, 8)
 $script:Pool.Open()
 
+function Start-VerifyJob {
+    <#
+      Same background-job treatment as a search, and for the same reason: a
+      post-purge estimate takes minutes, and GetContext() serves one request at
+      a time. A synchronous /purge-verify held the only request thread for the
+      whole estimate, so /health stopped answering and every other caller got
+      "connection cannot be established" -- exactly the failure the comment
+      above this section warns about. Answer 202, poll /search-status.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$CaseId,
+        [Parameter(Mandatory)][string]$SearchId
+    )
+
+    $jobId = [guid]::NewGuid().ToString('N').Substring(0, 16)
+    $script:Jobs[$jobId] = @{
+        job_id    = $jobId
+        status    = 'running'
+        action    = 'graph_ediscovery_purge_verify'
+        case_id   = $CaseId
+        search_id = $SearchId
+        started   = (Get-Date).ToUniversalTime().ToString('o')
+    }
+
+    $ps = [powershell]::Create()
+    $ps.RunspacePool = $script:Pool
+    [void]$ps.AddScript({
+        param($ScriptRoot, $Jobs, $JobId, $CaseId, $SearchId)
+        try {
+            . "$ScriptRoot/actions.ps1"
+            . "$ScriptRoot/graph.ps1"
+            $result = Invoke-GraphPurgeVerify -CaseId $CaseId -SearchId $SearchId
+            $result['job_id'] = $JobId
+            $result['finished'] = (Get-Date).ToUniversalTime().ToString('o')
+            $Jobs[$JobId] = $result
+        }
+        catch {
+            # verified_clean must be present and FALSE on failure. A missing key
+            # would leave the caller's gate reading undefined, and an undefined
+            # that is not 'true' is only safe by accident.
+            $Jobs[$JobId] = @{
+                job_id         = $JobId
+                status         = 'failed'
+                action         = 'graph_ediscovery_purge_verify'
+                case_id        = $CaseId
+                search_id      = $SearchId
+                verified_clean = $false
+                error          = $_.Exception.Message
+                finished       = (Get-Date).ToUniversalTime().ToString('o')
+            }
+        }
+    }).AddArgument($PSScriptRoot).AddArgument($script:Jobs).AddArgument($jobId).AddArgument($CaseId).AddArgument($SearchId) | Out-Null
+
+    [void]$ps.BeginInvoke()
+    return $script:Jobs[$jobId]
+}
+
 function Start-SearchJob {
     param(
         [Parameter(Mandatory)][string]$Query,
@@ -272,16 +329,24 @@ while ($listener.IsListening) {
                 break
             }
 
-            # Deliberately synchronous: it blocks until Graph finishes the estimate,
-            # so the caller cannot mistake "not measured yet" for "clean". Callers
-            # must allow several minutes.
-            'GET /purge-verify' {
-                $caseId = $request.QueryString['case_id']
-                $searchId = $request.QueryString['search_id']
+            # Asynchronous, like /search: answers 202 with a job_id and runs the
+            # estimate in a background runspace. Poll /search-status?job_id=...
+            # An earlier synchronous version blocked the single request thread
+            # for the whole estimate and took the worker offline.
+            'POST /purge-verify' {
+                $caseId = $body['case_id']
+                $searchId = $body['search_id']
                 if (-not $caseId -or -not $searchId) {
                     Write-Json $response @{ error = 'case_id and search_id are required' } 400; break
                 }
-                Write-Json $response (Invoke-GraphPurgeVerify -CaseId $caseId -SearchId $searchId)
+                Write-Json $response (Start-VerifyJob -CaseId $caseId -SearchId $searchId) 202
+                break
+            }
+
+            'GET /purge-verify' {
+                Write-Json $response @{
+                    error = 'purge-verify is asynchronous: POST {case_id, search_id} for a job_id, then poll /search-status?job_id=...'
+                } 405
                 break
             }
 
