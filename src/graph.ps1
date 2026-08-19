@@ -403,6 +403,56 @@ function Invoke-GraphPurge {
     }
 }
 
+function Invoke-GraphPurgeVerify {
+    <#
+      Re-runs the estimate on a search AFTER its purge reported success, and
+      reports what is still there.
+
+      This exists because "the purge succeeded" and "the mail is gone" are not
+      the same statement. purgeData returned status 'succeeded' at 100% on
+      CS5016743 and CS5016745 while every message stayed exactly where it was --
+      so a workflow that resolves the eSentire case on purge status alone closes
+      tickets for remediation that never happened, and writes "should NOT be
+      reopened" into the resolution notes while the phish sits in five inboxes.
+
+      Slow on purpose: it blocks until Graph finishes the estimate, because a
+      caller that gets an answer before the estimate completes learns nothing.
+      Note the index trails deletions by minutes, so a non-zero count shortly
+      after a purge is not proof of failure -- but zero IS proof of success.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$CaseId,
+        [Parameter(Mandatory)][string]$SearchId,
+        [int]$TimeoutSeconds = 900
+    )
+
+    Invoke-Graph -Method POST `
+        -Path "/security/cases/ediscoveryCases/$CaseId/searches/$SearchId/estimateStatistics" | Out-Null
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $op = $null
+    do {
+        Start-Sleep -Seconds 15
+        $op = Invoke-Graph -Method GET `
+            -Path "/security/cases/ediscoveryCases/$CaseId/searches/$SearchId/lastEstimateStatisticsOperation"
+    } while ($op.status -in @('notStarted', 'running', 'submitted') -and (Get-Date) -lt $deadline)
+
+    $remaining = if ($op.status -eq 'succeeded') { [int]$op.indexedItemCount } else { $null }
+
+    return @{
+        action              = 'graph_ediscovery_purge_verify'
+        case_id             = $CaseId
+        search_id           = $SearchId
+        status              = $op.status
+        remaining_items     = $remaining
+        remaining_mailboxes = if ($op.status -eq 'succeeded') { [int]$op.mailboxCount } else { $null }
+        # The ONLY field a caller should gate on. Null status or a timeout must
+        # never read as clean.
+        verified_clean      = ($op.status -eq 'succeeded' -and $remaining -eq 0)
+        note                = 'The eDiscovery index trails deletions, so re-check before treating a non-zero count as failure.'
+    }
+}
+
 function Get-GraphPurgeStatus {
     <#
       Replaces the Security & Compliance Get-ComplianceSearchAction path, which

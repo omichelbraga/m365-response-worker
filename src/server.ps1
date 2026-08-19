@@ -236,6 +236,19 @@ while ($listener.IsListening) {
                 break
             }
 
+            # Deliberately synchronous: it blocks until Graph finishes the estimate,
+            # so the caller cannot mistake "not measured yet" for "clean". Callers
+            # must allow several minutes.
+            'GET /purge-verify' {
+                $caseId = $request.QueryString['case_id']
+                $searchId = $request.QueryString['search_id']
+                if (-not $caseId -or -not $searchId) {
+                    Write-Json $response @{ error = 'case_id and search_id are required' } 400; break
+                }
+                Write-Json $response (Invoke-GraphPurgeVerify -CaseId $caseId -SearchId $searchId)
+                break
+            }
+
             default {
                 Write-Json $response @{ error = 'not found'; path = $path } 404
             }
