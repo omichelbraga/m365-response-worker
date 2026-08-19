@@ -95,12 +95,23 @@ function Start-VerifyJob {
 
     $ps = [powershell]::Create()
     $ps.RunspacePool = $script:Pool
+    # The runspace reads case_id and search_id back out of the job record rather
+    # than receiving them as parameters. Passing them in - positionally AND by
+    # name - delivered $null for CaseId specifically while SearchId and JobId
+    # arrived intact, and the job died in 5 ms with "Cannot bind argument to
+    # parameter 'CaseId'". The record in $script:Jobs is written by the caller
+    # and demonstrably correct: the 202 response is rendered from it. Read from
+    # the one copy that is known good.
     [void]$ps.AddScript({
-        param($ScriptRoot, $Jobs, $JobId, $CaseId, $SearchId)
+        param($ScriptRoot, $Jobs, $JobId)
+        $rec = $Jobs[$JobId]
+        $cid = [string]$rec['case_id']
+        $sid = [string]$rec['search_id']
         try {
+            if (-not $cid -or -not $sid) { throw "job record is missing case_id/search_id (case_id='$cid' search_id='$sid')" }
             . "$ScriptRoot/actions.ps1"
             . "$ScriptRoot/graph.ps1"
-            $result = Invoke-GraphPurgeVerify -CaseId $CaseId -SearchId $SearchId
+            $result = Invoke-GraphPurgeVerify -CaseId $cid -SearchId $sid
             $result['job_id'] = $JobId
             $result['finished'] = (Get-Date).ToUniversalTime().ToString('o')
             $Jobs[$JobId] = $result
@@ -113,8 +124,8 @@ function Start-VerifyJob {
                 job_id         = $JobId
                 status         = 'failed'
                 action         = 'graph_ediscovery_purge_verify'
-                case_id        = $CaseId
-                search_id      = $SearchId
+                case_id        = $cid
+                search_id      = $sid
                 verified_clean = $false
                 error          = $_.Exception.Message
                 finished       = (Get-Date).ToUniversalTime().ToString('o')
@@ -129,8 +140,6 @@ function Start-VerifyJob {
         ScriptRoot = $PSScriptRoot
         Jobs       = $script:Jobs
         JobId      = $jobId
-        CaseId     = $CaseId
-        SearchId   = $SearchId
     }) | Out-Null
 
     [void]$ps.BeginInvoke()
