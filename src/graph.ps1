@@ -613,8 +613,22 @@ function Invoke-GraphMailVerify {
                 $page++
                 $resp = Invoke-Graph -Method GET -Path $path
                 foreach ($m in $resp.value) {
+                    # StrictMode turns a read of a MISSING property into a throw,
+                    # and not every message carries 'from' -- drafts and some
+                    # system items do not. Two mailboxes failed verification with
+                    # "The property 'from' cannot be found on this object" purely
+                    # because of this. Probe before reading, exactly as Invoke-Graph
+                    # has to do for 'Response'.
                     $addr = $null
-                    if ($m.from -and $m.from.emailAddress) { $addr = [string]$m.from.emailAddress.address }
+                    if ($m.PSObject.Properties.Name -contains 'from') {
+                        $f = $m.from
+                        if ($f -and ($f.PSObject.Properties.Name -contains 'emailAddress')) {
+                            $ea = $f.emailAddress
+                            if ($ea -and ($ea.PSObject.Properties.Name -contains 'address')) {
+                                $addr = [string]$ea.address
+                            }
+                        }
+                    }
                     if (Test-SenderMatch $addr $Senders) {
                         $found += [ordered]@{ subject = "$($m.subject)"; from = $addr; received = "$($m.receivedDateTime)" }
                     }
