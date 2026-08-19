@@ -370,6 +370,26 @@ while ($listener.IsListening) {
                 break
             }
 
+            # Cheap Exchange pre-flight. Callers use it to decide scope BEFORE
+            # building a search, instead of discovering an inactive mailbox by
+            # creating a source and reading it back.
+            'POST /mailbox-check' {
+                if (-not $body['mailboxes']) { Write-Json $response @{ error = 'mailboxes[] is required' } 400; break }
+                Write-Json $response (Test-MailboxState -Mailboxes ([string[]]$body['mailboxes']))
+                break
+            }
+
+            # Diagnostic: eDiscovery counts Recoverable Items, so a soft-deleted
+            # message still shows up in an estimate. This says whether a
+            # "remaining" item is actually in the user's mailbox or just in the
+            # recoverable dumpster.
+            'POST /recoverable' {
+                if (-not $body['mailbox']) { Write-Json $response @{ error = 'mailbox is required' } 400; break }
+                Write-Json $response (Get-RecoverableCopies -Mailbox $body['mailbox'] `
+                    -SubjectContains $body['subject_contains'] -From $body['from'])
+                break
+            }
+
             default {
                 Write-Json $response @{ error = 'not found'; path = $path } 404
             }

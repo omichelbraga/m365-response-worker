@@ -113,6 +113,102 @@ function Invoke-Diagnostics {
     }
 }
 
+function Test-MailboxState {
+    <#
+      Ask Exchange what each address actually is, BEFORE any eDiscovery search is
+      built.
+
+      This exists because the worker used to discover an inactive mailbox the
+      hard way: create the source, read the displayName Graph hands back, notice
+      "(Inactive Mailbox)", then unpick it. That is backwards -- it has to make
+      the mistake before it can detect it -- and one inactive source silently
+      collapses the estimate for every other mailbox in the same search (four
+      active mailboxes holding one message each estimated as 1).
+
+      Knowing up front means inactive mailboxes are simply never added, the
+      estimate is never corrupted, and the card can say plainly which addresses
+      were searched and which were not.
+    #>
+    param([Parameter(Mandatory)][string[]]$Mailboxes)
+
+    Connect-Exo
+    try {
+        $results = @()
+        foreach ($mbx in $Mailboxes) {
+            $rec = [ordered]@{ email = $mbx; exists = $false; inactive = $false; searchable = $false }
+            try {
+                $m = Get-Mailbox -Identity $mbx -ErrorAction Stop
+                $rec.exists = $true
+                # IsInactiveMailbox is the Exchange flag for a mailbox whose user
+                # is gone but which is retained by a hold.
+                $rec.inactive = [bool]$m.IsInactiveMailbox
+                $rec.searchable = -not $rec.inactive
+                $rec.display = $m.DisplayName
+                $rec.type = "$($m.RecipientTypeDetails)"
+            }
+            catch {
+                # Not a mailbox at all: a distribution list, an alias that does
+                # not resolve, or a departed user. Either way it cannot be a
+                # scoped source, and saying so here is cheaper than a 400 later.
+                $rec.error = $_.Exception.Message
+                # An inactive mailbox is only returned when asked for explicitly.
+                try {
+                    $im = Get-Mailbox -Identity $mbx -InactiveMailboxOnly -ErrorAction Stop
+                    if ($im) {
+                        $rec.exists = $true
+                        $rec.inactive = $true
+                        $rec.display = $im.DisplayName
+                        $rec.type = "$($im.RecipientTypeDetails)"
+                        $rec.error = $null
+                    }
+                }
+                catch { }
+            }
+            $results += $rec
+        }
+        return @{ action = 'mailbox_state'; results = $results }
+    }
+    finally { Disconnect-Exo }
+}
+
+function Get-RecoverableCopies {
+    <#
+      Lists what is sitting in a mailbox's Recoverable Items.
+
+      eDiscovery counts Recoverable Items, so a message that was SOFT deleted is
+      still counted by an estimate even though the user cannot see it. That makes
+      a post-purge verification report "still there" for mail that is, from the
+      user's point of view, gone -- and the case then never closes. This is how
+      to tell the two apart.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Mailbox,
+        [string]$SubjectContains,
+        [string]$From
+    )
+
+    Connect-Exo
+    try {
+        $params = @{ Identity = $Mailbox; ErrorAction = 'Stop' }
+        if ($SubjectContains) { $params['SubjectContains'] = $SubjectContains }
+        $items = @(Get-RecoverableItems @params)
+        $out = @()
+        foreach ($i in $items) {
+            if ($From -and ("$($i.From)" -notlike "*$From*")) { continue }
+            $out += [ordered]@{
+                subject       = "$($i.Subject)"
+                from          = "$($i.From)"
+                received      = "$($i.LastModifiedTime)"
+                folder        = "$($i.LastParentFolderPath)"
+                item_class    = "$($i.ItemClass)"
+                policy_tag    = "$($i.PolicyTag)"
+            }
+        }
+        return @{ action = 'recoverable_items'; mailbox = $Mailbox; count = $out.Count; items = $out }
+    }
+    finally { Disconnect-Exo }
+}
+
 function Invoke-BlockSender {
     <#
       Adds a sender to the Tenant Allow/Block List. There is no REST equivalent:
