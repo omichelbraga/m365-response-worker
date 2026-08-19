@@ -572,16 +572,69 @@ function Invoke-GraphPurgeVerify {
         [int]$TimeoutSeconds = 900
     )
 
-    Invoke-Graph -Method POST `
-        -Path "/security/cases/ediscoveryCases/$CaseId/searches/$SearchId/estimateStatistics" | Out-Null
+    # Verify with a FRESH search, never by re-estimating the one that was purged.
+    #
+    # Re-estimating the purged search reported remaining_items 0 and
+    # verified_clean TRUE while the message was still in four mailboxes. The same
+    # search reported 5 a few minutes later, unchanged. An estimate taken on a
+    # search whose sources or scope were recently touched can be stale, and a
+    # stale zero here closes an eSentire case as remediated.
+    #
+    # Every freshly created search measured tonight was correct; every reused or
+    # mutated one was not. So this copies the query and scope onto a throwaway
+    # search, measures that, and deletes it.
+    $orig = Invoke-Graph -Method GET -Path "/security/cases/ediscoveryCases/$CaseId/searches/$SearchId"
+    $verifyName = "verify-$SearchId-$([guid]::NewGuid().ToString('N').Substring(0,8))"
 
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    $op = $null
-    do {
-        Start-Sleep -Seconds 15
-        $op = Invoke-Graph -Method GET `
-            -Path "/security/cases/ediscoveryCases/$CaseId/searches/$SearchId/lastEstimateStatisticsOperation"
-    } while ($op.status -in @('notStarted', 'running', 'submitted') -and (Get-Date) -lt $deadline)
+    $probe = Invoke-Graph -Method POST -Path "/security/cases/ediscoveryCases/$CaseId/searches" -Body @{
+        displayName      = $verifyName
+        contentQuery     = $orig.contentQuery
+        dataSourceScopes = 'allTenantMailboxes'
+    }
+
+    try {
+        # Mirror the original's scope. A scoped original is verified scoped (fast);
+        # a tenant-wide one is verified tenant-wide.
+        if ($orig.dataSourceScopes -eq 'none') {
+            $srcs = Invoke-Graph -Method GET `
+                -Path "/security/cases/ediscoveryCases/$CaseId/searches/$SearchId/additionalSources"
+            $added = 0
+            foreach ($src in $srcs.value) {
+                if (-not $src.email) { continue }
+                # Never copy an inactive mailbox: one of them collapses the whole
+                # estimate to a single item, which would fake a clean result.
+                if ($src.displayName -match '\(Inactive Mailbox\)') { continue }
+                try {
+                    Invoke-Graph -Method POST `
+                        -Path "/security/cases/ediscoveryCases/$CaseId/searches/$($probe.id)/additionalSources" `
+                        -Body @{ '@odata.type' = 'microsoft.graph.security.userSource'; email = $src.email } | Out-Null
+                    $added++
+                }
+                catch { Write-Host "verify: could not copy source '$($src.email)': $($_.Exception.Message)" }
+            }
+            if ($added -gt 0) {
+                Invoke-Graph -Method PATCH `
+                    -Path "/security/cases/ediscoveryCases/$CaseId/searches/$($probe.id)" `
+                    -Body @{ dataSourceScopes = 'none' } | Out-Null
+            }
+        }
+
+        Invoke-Graph -Method POST `
+            -Path "/security/cases/ediscoveryCases/$CaseId/searches/$($probe.id)/estimateStatistics" | Out-Null
+
+        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+        $op = $null
+        do {
+            Start-Sleep -Seconds 15
+            $op = Invoke-Graph -Method GET `
+                -Path "/security/cases/ediscoveryCases/$CaseId/searches/$($probe.id)/lastEstimateStatisticsOperation"
+        } while ($op.status -in @('notStarted', 'running', 'submitted') -and (Get-Date) -lt $deadline)
+    }
+    finally {
+        # The probe is disposable and must not accumulate in the case.
+        try { Invoke-Graph -Method DELETE -Path "/security/cases/ediscoveryCases/$CaseId/searches/$($probe.id)" | Out-Null }
+        catch { Write-Host "verify: could not delete probe search $($probe.id): $($_.Exception.Message)" }
+    }
 
     $remaining = if ($op.status -eq 'succeeded') { [int]$op.indexedItemCount } else { $null }
 
@@ -589,6 +642,7 @@ function Invoke-GraphPurgeVerify {
         action              = 'graph_ediscovery_purge_verify'
         case_id             = $CaseId
         search_id           = $SearchId
+        measured_with       = 'fresh probe search (the purged search is never re-estimated)'
         status              = $op.status
         remaining_items     = $remaining
         remaining_mailboxes = if ($op.status -eq 'succeeded') { [int]$op.mailboxCount } else { $null }
