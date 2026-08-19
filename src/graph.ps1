@@ -200,7 +200,12 @@ function Invoke-GraphSearch {
         # at 730 s against this tenant, so the old 600 s ceiling failed every
         # real search a couple of minutes before Graph finished. Callers run this
         # on a background job, so a generous ceiling costs nothing.
-        [int]$TimeoutSeconds = 3600
+        [int]$TimeoutSeconds = 3600,
+        # Above this many named recipients, scoping stops being worth it: each
+        # mailbox is a separate source to create and commit, and a tenant-wide
+        # sweep answers the same question in one pass. Below it, scoped is far
+        # faster (minutes vs ~15-25).
+        [int]$TenantWideThreshold = 25
     )
 
     if (-not $Name) { $Name = "auto-$([guid]::NewGuid().ToString('N').Substring(0,12))" }
@@ -241,6 +246,10 @@ function Invoke-GraphSearch {
 
     $created = $false
     $unresolved = @()
+    # Mailboxes that exist but are INACTIVE. They cannot be used as a scoped
+    # source without corrupting the estimate, and a scoped search cannot see
+    # their contents at all -- only a tenant-wide sweep can.
+    $inactive = @()
     if ($existing) {
         $search = $existing
         Write-Host "Reusing search '$Name' ($($search.id))"
@@ -274,20 +283,61 @@ function Invoke-GraphSearch {
             # Add only what is missing. Sources are never removed: an extra
             # mailbox left over from an earlier run simply returns no hits,
             # whereas removing one risks dropping a recipient still in scope.
+            # The ONE exception is an inactive mailbox -- see below.
             try {
                 $srcs = Invoke-Graph -Method GET `
                     -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)/additionalSources"
-                foreach ($s in $srcs.value) { if ($s.email) { $have += $s.email.ToLower() } }
+                foreach ($s in $srcs.value) {
+                    if (-not $s.email) { continue }
+                    if ($s.displayName -match '\(Inactive Mailbox\)') {
+                        # A REUSED search can already carry one from an earlier run,
+                        # and it poisons every estimate until removed.
+                        Write-Host "Removing inactive mailbox source '$($s.email)' from reused search"
+                        try {
+                            Invoke-Graph -Method DELETE `
+                                -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)/additionalSources/$($s.id)" | Out-Null
+                        }
+                        catch { Write-Host "Could not remove inactive source '$($s.email)': $($_.Exception.Message)" }
+                        $inactive += $s.email
+                        continue
+                    }
+                    $have += $s.email.ToLower()
+                }
             }
             catch { $have = @() }
 
             foreach ($mbx in $Mailboxes) {
                 if ($have -contains $mbx.ToLower()) { continue }
+                if ($inactive -contains $mbx) { continue }
                 try {
                     # email only: includedSources is returned by Graph, not accepted.
-                    Invoke-Graph -Method POST `
+                    $src = Invoke-Graph -Method POST `
                         -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)/additionalSources" `
-                        -Body @{ '@odata.type' = 'microsoft.graph.security.userSource'; email = $mbx } | Out-Null
+                        -Body @{ '@odata.type' = 'microsoft.graph.security.userSource'; email = $mbx }
+
+                    # ONE inactive mailbox in the source list collapses the WHOLE
+                    # estimate to a single item -- not just its own contribution.
+                    # Measured directly: four active mailboxes holding one message
+                    # each estimate as 4; add one inactive mailbox and the same
+                    # search estimates as 1. The purge then clears only what the
+                    # search can see, so CS5016743 reported "1 message in 1
+                    # mailbox", purged one copy, and left four behind while
+                    # reporting success.
+                    #
+                    # Graph only reveals it in the displayName it returns, so the
+                    # source has to be created before it can be recognised. Drop it
+                    # and record it: the caller escalates to a tenant-wide search,
+                    # which CAN see inactive mailboxes.
+                    if ($src.displayName -match '\(Inactive Mailbox\)') {
+                        Write-Host "Mailbox '$mbx' is an inactive mailbox; removing it as a source and flagging for tenant-wide"
+                        try {
+                            Invoke-Graph -Method DELETE `
+                                -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)/additionalSources/$($src.id)" | Out-Null
+                        }
+                        catch { Write-Host "Could not remove inactive source '$mbx': $($_.Exception.Message)" }
+                        $inactive += $mbx
+                        continue
+                    }
                     $have += $mbx.ToLower()
                 }
                 catch {
@@ -303,13 +353,29 @@ function Invoke-GraphSearch {
             }
         }
 
-        # 'none' is only legal once at least one source exists. If not a single
-        # named mailbox resolved, fall back to a tenant-wide sweep rather than
-        # failing outright -- slower, but it still answers the question.
+        # 'none' is only legal once at least one source exists. Escalate to a
+        # tenant-wide sweep whenever scoping cannot answer the question honestly.
+        # Slower, but a slow true answer beats a fast false one -- the scoped
+        # estimate that read "1 message in 1 mailbox" while four mailboxes held
+        # the phish is what this guards against.
         $haveAny = ($have.Count -gt 0)
-        $effectiveScoped = ($scoped -and $haveAny)
-        if ($scoped -and -not $haveAny) {
-            Write-Host "No named mailbox resolved; falling back to a tenant-wide search"
+        $hasInactive = ($inactive.Count -gt 0)
+        $tooMany = ($scoped -and $Mailboxes.Count -gt $TenantWideThreshold)
+        $effectiveScoped = ($scoped -and $haveAny -and -not $hasInactive -and -not $tooMany)
+
+        $scopeReason = 'scoped to the named mailboxes'
+        if (-not $scoped) { $scopeReason = 'no mailboxes named; tenant-wide' }
+        elseif ($hasInactive) {
+            $scopeReason = "tenant-wide: $($inactive.Count) inactive mailbox(es) in scope ($($inactive -join ', ')) - a scoped search cannot see them and one of them corrupts the whole estimate"
+            Write-Host $scopeReason
+        }
+        elseif ($tooMany) {
+            $scopeReason = "tenant-wide: $($Mailboxes.Count) recipients exceeds the scoping threshold of $TenantWideThreshold"
+            Write-Host $scopeReason
+        }
+        elseif (-not $haveAny) {
+            $scopeReason = 'tenant-wide: not one named mailbox resolved'
+            Write-Host $scopeReason
         }
         Invoke-Graph -Method PATCH `
             -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)" `
@@ -353,9 +419,16 @@ function Invoke-GraphSearch {
         search_id     = $search.id
         search_name   = $Name
         query         = $Query
-        scope         = if ($scoped -and $unresolved.Count -lt $Mailboxes.Count) { 'mailboxes' } else { 'all_tenant_mailboxes' }
+        # Derived from what the search ACTUALLY ended up scoped to, not from what
+        # was requested. Reporting 'mailboxes' for a search that quietly went
+        # tenant-wide is how a card ends up describing a different search than
+        # the one it ran.
+        scope         = if ($effectiveScoped) { 'mailboxes' } else { 'all_tenant_mailboxes' }
+        scope_reason  = $scopeReason
         mailboxes     = if ($scoped) { @($Mailboxes) } else { @() }
+        searched      = @($have)
         unresolved    = @($unresolved)
+        inactive      = @($inactive)
         total_items   = [int]$op.indexedItemCount
         total_size    = [int64]$op.indexedItemsSize
         mailbox_count = [int]$op.mailboxCount

@@ -73,7 +73,8 @@ function Start-SearchJob {
     param(
         [Parameter(Mandatory)][string]$Query,
         [string]$Name,
-        [string[]]$Mailboxes
+        [string[]]$Mailboxes,
+        [int]$TenantWideThreshold = 25
     )
 
     # A search is identified by its NAME, and Invoke-GraphSearch REUSES the Graph
@@ -122,7 +123,7 @@ function Start-SearchJob {
     $ps = [powershell]::Create()
     $ps.RunspacePool = $script:Pool
     [void]$ps.AddScript({
-        param($ScriptRoot, $Jobs, $JobId, $Query, $Name, $Mailboxes)
+        param($ScriptRoot, $Jobs, $JobId, $Query, $Name, $Mailboxes, $Threshold)
         # A fresh runspace shares no state with the server, so the modules have
         # to be dot-sourced again. Environment variables are process-wide and
         # come across on their own.
@@ -130,7 +131,7 @@ function Start-SearchJob {
             . "$ScriptRoot/actions.ps1"
             . "$ScriptRoot/graph.ps1"
             $result = if ($Mailboxes -and $Mailboxes.Count -gt 0) {
-                Invoke-GraphSearch -Query $Query -Name $Name -Mailboxes $Mailboxes
+                Invoke-GraphSearch -Query $Query -Name $Name -Mailboxes $Mailboxes -TenantWideThreshold $Threshold
             }
             else {
                 Invoke-GraphSearch -Query $Query -Name $Name
@@ -155,7 +156,7 @@ function Start-SearchJob {
                 finished    = (Get-Date).ToUniversalTime().ToString('o')
             }
         }
-    }).AddArgument($PSScriptRoot).AddArgument($script:Jobs).AddArgument($jobId).AddArgument($Query).AddArgument($Name).AddArgument($Mailboxes) | Out-Null
+    }).AddArgument($PSScriptRoot).AddArgument($script:Jobs).AddArgument($jobId).AddArgument($Query).AddArgument($Name).AddArgument($Mailboxes).AddArgument($TenantWideThreshold) | Out-Null
 
     [void]$ps.BeginInvoke()
     return $script:Jobs[$jobId]
@@ -221,7 +222,10 @@ while ($listener.IsListening) {
                 # learn whether that specific mailbox holds the message --
                 # estimateStatistics never names the mailboxes it counted.
                 $mbx = if ($body['mailboxes']) { [string[]]$body['mailboxes'] } else { @() }
-                $job = Start-SearchJob -Query $body['query'] -Name $body['name'] -Mailboxes $mbx
+                # Optional. Above this many recipients the search goes tenant-wide
+                # instead of creating a source per mailbox.
+                $thr = if ($body['tenant_wide_threshold']) { [int]$body['tenant_wide_threshold'] } else { 25 }
+                $job = Start-SearchJob -Query $body['query'] -Name $body['name'] -Mailboxes $mbx -TenantWideThreshold $thr
                 Write-Json $response $job 202
                 break
             }
