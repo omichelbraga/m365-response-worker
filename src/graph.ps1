@@ -279,7 +279,12 @@ function Invoke-GraphSearch {
         # tenant-wide call.
         $have = @()
 
-        if ($scoped) {
+        # Decided BEFORE any source is created: past the threshold there is no
+        # point paying to create and commit a source per mailbox for a search
+        # that is going tenant-wide anyway.
+        $tooMany = ($scoped -and $Mailboxes.Count -gt $TenantWideThreshold)
+
+        if ($scoped -and -not $tooMany) {
             # Add only what is missing. Sources are never removed: an extra
             # mailbox left over from an earlier run simply returns no hits,
             # whereas removing one risks dropping a recipient still in scope.
@@ -360,8 +365,30 @@ function Invoke-GraphSearch {
         # the phish is what this guards against.
         $haveAny = ($have.Count -gt 0)
         $hasInactive = ($inactive.Count -gt 0)
-        $tooMany = ($scoped -and $Mailboxes.Count -gt $TenantWideThreshold)
         $effectiveScoped = ($scoped -and $haveAny -and -not $hasInactive -and -not $tooMany)
+
+        # A tenant-wide search must have NO sources. Setting dataSourceScopes to
+        # allTenantMailboxes while additionalSources remain does NOT widen the
+        # search: measured, four leftover sources plus allTenantMailboxes still
+        # returned 1 item -- the same wrong answer the sources alone gave. The
+        # scope field said tenant-wide and the search behaved as if scoped, which
+        # is the worst of both. So when escalating, strip every source first.
+        if (-not $effectiveScoped) {
+            try {
+                $cur = Invoke-Graph -Method GET `
+                    -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)/additionalSources"
+                foreach ($s in $cur.value) {
+                    try {
+                        Invoke-Graph -Method DELETE `
+                            -Path "/security/cases/ediscoveryCases/$caseId/searches/$($search.id)/additionalSources/$($s.id)" | Out-Null
+                        Write-Host "Removed source '$($s.email)' so the tenant-wide search is genuinely tenant-wide"
+                    }
+                    catch { Write-Host "Could not remove source '$($s.email)': $($_.Exception.Message)" }
+                }
+            }
+            catch { Write-Host "Could not list sources to strip: $($_.Exception.Message)" }
+            $have = @()
+        }
 
         $scopeReason = 'scoped to the named mailboxes'
         if (-not $scoped) { $scopeReason = 'no mailboxes named; tenant-wide' }
