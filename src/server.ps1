@@ -76,6 +76,38 @@ function Start-SearchJob {
         [string[]]$Mailboxes
     )
 
+    # A search is identified by its NAME, and Invoke-GraphSearch REUSES the Graph
+    # search of that name rather than creating a second one. So two jobs running
+    # the same name are not two searches -- they are two callers mutating one
+    # search object at the same time. Graph answers the loser with
+    #   400 "Committed in-progress Source collection <id>, can not be updated"
+    # and that whole run reports SEARCH FAILED.
+    #
+    # This is not hypothetical: a manual Poller run and the scheduled tick 96
+    # seconds later processed CS5016743 and CS5016745 together, and every search
+    # in the second run died that way. Two cards reached Teams per case, one
+    # usable and one broken.
+    #
+    # Returning the IN-FLIGHT job rather than an error is deliberate: the second
+    # caller wanted the estimate for that exact search, and that is precisely
+    # what the running job will produce. Both callers poll the same job_id and
+    # get the same answer.
+    if ($Name) {
+        $existing = $null
+        foreach ($k in @($script:Jobs.Keys)) {
+            $j = $script:Jobs[$k]
+            if ($j -and $j['status'] -eq 'running' -and $j['name'] -eq $Name) { $existing = $j; break }
+        }
+        if ($existing) {
+            Write-Host "Search '$Name' is already running as job $($existing['job_id']); returning it instead of starting a second."
+            $copy = @{}
+            foreach ($k in $existing.Keys) { $copy[$k] = $existing[$k] }
+            $copy['deduped'] = $true
+            $copy['note'] = 'A search with this name was already running; this is that job. Two callers mutating one Graph search is what produces "Committed in-progress Source collection".'
+            return $copy
+        }
+    }
+
     $jobId = [guid]::NewGuid().ToString('N').Substring(0, 16)
     $script:Jobs[$jobId] = @{
         job_id    = $jobId
