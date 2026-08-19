@@ -552,6 +552,109 @@ function Invoke-GraphPurge {
     }
 }
 
+function Invoke-GraphMailVerify {
+    <#
+      Ask the MAILBOX whether the message is still there, not eDiscovery.
+
+      Demonstrated side by side on one mailbox, minutes apart: Graph returned an
+      empty result for the message while an eDiscovery estimate on the same query
+      reported 2 items remaining. The message was genuinely gone -- deleted, and
+      confirmed absent from Inbox and Deleted Items. eDiscovery reports deleted
+      mail as present, for hours.
+
+      Every purge this worker ran actually worked. What kept failing was the
+      verification, because it asked an index instead of the mailbox. This reads
+      the same view Outlook shows and answers in about a second.
+
+      Needs Mail.ReadBasic (application). Basic properties only -- subject, from,
+      receivedDateTime -- so this cannot read anyone's message bodies. Filtering
+      is on those properties for the same reason: $search reaches into bodies and
+      is refused under ReadBasic.
+    #>
+    param(
+        [Parameter(Mandatory)][string[]]$Mailboxes,
+        [Parameter(Mandatory)][string[]]$Senders,
+        [string]$From,
+        [string]$To
+    )
+
+    # A sender entry is either a full address or a bare domain, so matching is
+    # done here rather than in $filter: endswith() on from/emailAddress/address
+    # is rejected as an inefficient filter by Exchange's backend.
+    function Test-SenderMatch([string]$addr, [string[]]$wanted) {
+        if (-not $addr) { return $false }
+        $a = $addr.ToLower()
+        foreach ($w in $wanted) {
+            $x = $w.ToLower().TrimStart('@')
+            if ($a -eq $x) { return $true }
+            if ($a.EndsWith("@$x")) { return $true }
+            # sub-domain of a named domain, e.g. mail.example.com under example.com
+            if ($a -match "@(.+\.)?$([regex]::Escape($x))$") { return $true }
+        }
+        return $false
+    }
+
+    $perMailbox = @()
+    $total = 0
+
+    foreach ($mbx in $Mailboxes) {
+        $found = @()
+        $err = $null
+        try {
+            $filter = @()
+            if ($From) { $filter += "receivedDateTime ge $($From)T00:00:00Z" }
+            if ($To) { $filter += "receivedDateTime le $($To)T23:59:59Z" }
+            $qs = '$select=subject,receivedDateTime,from&$top=100'
+            if ($filter.Count) { $qs = '$filter=' + [uri]::EscapeDataString(($filter -join ' and ')) + '&' + $qs }
+
+            $path = "/users/$([uri]::EscapeDataString($mbx))/messages?$qs"
+            $page = 0
+            while ($path -and $page -lt 20) {
+                $page++
+                $resp = Invoke-Graph -Method GET -Path $path
+                foreach ($m in $resp.value) {
+                    $addr = $null
+                    if ($m.from -and $m.from.emailAddress) { $addr = [string]$m.from.emailAddress.address }
+                    if (Test-SenderMatch $addr $Senders) {
+                        $found += [ordered]@{ subject = "$($m.subject)"; from = $addr; received = "$($m.receivedDateTime)" }
+                    }
+                }
+                $next = $null
+                if ($resp.PSObject.Properties.Name -contains '@odata.nextLink') { $next = [string]$resp.'@odata.nextLink' }
+                $path = if ($next) { $next -replace '^https://graph\.microsoft\.com/v1\.0', '' } else { $null }
+            }
+        }
+        catch {
+            # A mailbox we cannot read is NOT a clean mailbox. Record the failure
+            # so the caller refuses to call the case verified.
+            $err = $_.Exception.Message
+            Write-Host "mail-verify: could not read '$mbx': $err"
+        }
+
+        $total += $found.Count
+        $perMailbox += [ordered]@{
+            mailbox   = $mbx
+            remaining = if ($err) { $null } else { $found.Count }
+            error     = $err
+            messages  = @($found | Select-Object -First 5)
+        }
+    }
+
+    $unreadable = @($perMailbox | Where-Object { $_.error })
+
+    return @{
+        action         = 'graph_mail_verify'
+        measured_with  = 'Graph mail (the mailbox itself, not the eDiscovery index)'
+        mailboxes      = @($perMailbox)
+        remaining_items = $total
+        unreadable     = @($unreadable | ForEach-Object { $_.mailbox })
+        # Clean ONLY when every mailbox was readable and every one came back empty.
+        verified_clean = ($total -eq 0 -and $unreadable.Count -eq 0 -and $Mailboxes.Count -gt 0)
+        senders        = @($Senders)
+        window         = "$From..$To"
+    }
+}
+
 function Invoke-GraphPurgeVerify {
     <#
       Re-runs the estimate on a search AFTER its purge reported success, and
@@ -587,6 +690,39 @@ function Invoke-GraphPurgeVerify {
     # mutated one was not. So this copies the query and scope onto a throwaway
     # search, measures that, and deletes it.
     $orig = Invoke-Graph -Method GET -Path "/security/cases/ediscoveryCases/$CaseId/searches/$SearchId"
+
+    # PREFER THE MAILBOX. eDiscovery reported 2 items remaining for a message that
+    # Graph confirmed was gone from the mailbox entirely, minutes apart, on the
+    # same query. Every purge this worker ran worked; the verification was what
+    # kept failing, because it asked the index instead of the mailbox. Only fall
+    # back to an eDiscovery probe when there are no named mailboxes to read --
+    # a tenant-wide search -- and say so in the result.
+    $srcList = @()
+    try {
+        $srcResp = Invoke-Graph -Method GET `
+            -Path "/security/cases/ediscoveryCases/$CaseId/searches/$SearchId/additionalSources"
+        $srcList = @($srcResp.value | Where-Object { $_.email } | ForEach-Object { [string]$_.email })
+    }
+    catch { Write-Host "verify: could not list sources: $($_.Exception.Message)" }
+
+    if ($srcList.Count -gt 0) {
+        $q = [string]$orig.contentQuery
+        # The query is built by this worker, so its shape is known:
+        #   (From:"a" OR From:"b") AND (Received:YYYY-MM-DD..YYYY-MM-DD)
+        $senders = @([regex]::Matches($q, 'From:"([^"]+)"') | ForEach-Object { $_.Groups[1].Value })
+        $win = [regex]::Match($q, 'Received:(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})')
+        $wFrom = if ($win.Success) { $win.Groups[1].Value } else { $null }
+        $wTo = if ($win.Success) { $win.Groups[2].Value } else { $null }
+
+        if ($senders.Count -gt 0) {
+            $r = Invoke-GraphMailVerify -Mailboxes $srcList -Senders $senders -From $wFrom -To $wTo
+            $r['case_id'] = $CaseId
+            $r['search_id'] = $SearchId
+            return $r
+        }
+        Write-Host "verify: no senders parsed from contentQuery, falling back to an eDiscovery probe"
+    }
+
     $verifyName = "verify-$SearchId-$([guid]::NewGuid().ToString('N').Substring(0,8))"
 
     $probe = Invoke-Graph -Method POST -Path "/security/cases/ediscoveryCases/$CaseId/searches" -Body @{
