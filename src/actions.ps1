@@ -195,6 +195,14 @@ function Get-RecoverableCopies {
       a post-purge verification report "still there" for mail that is, from the
       user's point of view, gone -- and the case then never closes. This is how
       to tell the two apart.
+
+      Read through GRAPH rather than Get-RecoverableItems. That cmdlet is gated
+      behind the Mailbox Import Export RBAC role, and EXO omits cmdlets the
+      connecting principal holds no role for instead of failing the call -- so
+      under app-only certificate auth it surfaced as CommandNotFoundException on
+      every request, which reads like a typo rather than a missing role and cost
+      an investigation to run down (Halo 0050661). Graph needs only the
+      Mail.ReadBasic this worker already has, and shows the same view.
     #>
     param(
         [Parameter(Mandatory)][string]$Mailbox,
@@ -202,26 +210,67 @@ function Get-RecoverableCopies {
         [string]$From
     )
 
-    Connect-Exo
-    try {
-        $params = @{ Identity = $Mailbox; ErrorAction = 'Stop' }
-        if ($SubjectContains) { $params['SubjectContains'] = $SubjectContains }
-        $items = @(Get-RecoverableItems @params)
-        $out = @()
-        foreach ($i in $items) {
-            if ($From -and ("$($i.From)" -notlike "*$From*")) { continue }
-            $out += [ordered]@{
-                subject       = "$($i.Subject)"
-                from          = "$($i.From)"
-                received      = "$($i.LastModifiedTime)"
-                folder        = "$($i.LastParentFolderPath)"
-                item_class    = "$($i.ItemClass)"
-                policy_tag    = "$($i.PolicyTag)"
+    $enc = [uri]::EscapeDataString($Mailbox)
+    $out = @()
+    $scanned = 0
+    $unreadable = @()
+
+    # Deletions is the dumpster a user can still recover from. Purges is where a
+    # hard delete leaves the item when a hold keeps it alive -- which is exactly
+    # this mailbox's case (compliance_tag_hold). A caller asking "is it really
+    # gone" needs both. Purges only exists on a held mailbox, so a failure there
+    # is a normal answer for an unheld one, not an error worth throwing over.
+    foreach ($folder in @('recoverableitemsdeletions', 'recoverableitemspurges')) {
+        $url = "/users/$enc/mailFolders/$folder/messages?`$select=subject,from,receivedDateTime&`$top=100"
+        $pages = 0
+        while ($url -and $pages -lt 10) {
+            try { $resp = Invoke-Graph -Method GET -Path $url }
+            catch {
+                $unreadable += $folder
+                Write-Host "recoverable: $folder unreadable on ${Mailbox}: $($_.Exception.Message)"
+                break
             }
+
+            foreach ($m in @($resp.value)) {
+                $scanned++
+                # StrictMode: reading a property that is absent THROWS, and Graph
+                # omits 'from' on drafts and some system items. Probe first.
+                $addr = ''
+                if ($m.PSObject.Properties.Name -contains 'from' -and $m.from) {
+                    $f = $m.from
+                    if ($f.PSObject.Properties.Name -contains 'emailAddress' -and $f.emailAddress) {
+                        $addr = [string]$f.emailAddress.address
+                    }
+                }
+                $subj = if ($m.PSObject.Properties.Name -contains 'subject') { [string]$m.subject } else { '' }
+
+                if ($From -and ($addr -notlike "*$From*")) { continue }
+                if ($SubjectContains -and ($subj -notlike "*$SubjectContains*")) { continue }
+
+                $out += [ordered]@{
+                    subject  = $subj
+                    from     = $addr
+                    received = "$($m.receivedDateTime)"
+                    folder   = $folder
+                }
+            }
+
+            $next = $null
+            if ($resp.PSObject.Properties.Name -contains '@odata.nextLink') { $next = [string]$resp.'@odata.nextLink' }
+            $url = if ($next) { $next -replace '^https://graph\.microsoft\.com/v1\.0', '' } else { $null }
+            $pages++
         }
-        return @{ action = 'recoverable_items'; mailbox = $Mailbox; count = $out.Count; items = $out }
     }
-    finally { Disconnect-Exo }
+
+    return @{
+        action        = 'recoverable_items'
+        mailbox       = $Mailbox
+        count         = $out.Count
+        scanned       = $scanned
+        items         = $out
+        unreadable    = @($unreadable | Select-Object -Unique)
+        measured_with = 'graph mail (recoverableitemsdeletions + recoverableitemspurges)'
+    }
 }
 
 function Invoke-BlockSender {

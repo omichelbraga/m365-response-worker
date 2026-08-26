@@ -721,10 +721,27 @@ function Invoke-GraphPurgeVerify {
 
     if ($srcList.Count -gt 0) {
         $q = [string]$orig.contentQuery
-        # The query is built by this worker, so its shape is known:
-        #   (From:"a" OR From:"b") AND (Received:YYYY-MM-DD..YYYY-MM-DD)
-        $senders = @([regex]::Matches($q, 'From:"([^"]+)"') | ForEach-Object { $_.Groups[1].Value })
-        $win = [regex]::Match($q, 'Received:(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})')
+        # KQL keywords are case-INSENSITIVE, and the query is CALLER-supplied --
+        # n8n, a manual curl, and this worker each write it differently. A
+        # case-sensitive 'From:"..."' matched nothing against a lowercase
+        # 'from:"..."' query, so $senders came back empty and this fell through
+        # to the eDiscovery probe: the exact ask-the-index-not-the-mailbox answer
+        # this whole function exists to avoid. It reported 7 items remaining on a
+        # mailbox that had just been purged clean (Halo 0050661). Match
+        # case-insensitively, quoted or bare, across the sender keywords KQL
+        # accepts.
+        $senders = @(
+            [regex]::Matches($q, '(?i)(?:from|sender|participants)\s*:\s*"([^"]+)"') |
+                ForEach-Object { $_.Groups[1].Value }
+        )
+        if ($senders.Count -eq 0) {
+            $senders = @(
+                [regex]::Matches($q, '(?i)(?:from|sender|participants)\s*:\s*([^\s()"]+)') |
+                    ForEach-Object { $_.Groups[1].Value }
+            )
+        }
+        $senders = @($senders | Where-Object { $_ } | Select-Object -Unique)
+        $win = [regex]::Match($q, '(?i)received\s*:\s*(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})')
         $wFrom = if ($win.Success) { $win.Groups[1].Value } else { $null }
         $wTo = if ($win.Success) { $win.Groups[2].Value } else { $null }
 
