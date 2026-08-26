@@ -731,12 +731,12 @@ function Invoke-GraphPurgeVerify {
         # case-insensitively, quoted or bare, across the sender keywords KQL
         # accepts.
         $senders = @(
-            [regex]::Matches($q, '(?i)(?:from|sender|participants)\s*:\s*"([^"]+)"') |
+            [regex]::Matches($q, '(?i)\b(?:from|sender|participants)\s*:\s*"([^"]+)"') |
                 ForEach-Object { $_.Groups[1].Value }
         )
         if ($senders.Count -eq 0) {
             $senders = @(
-                [regex]::Matches($q, '(?i)(?:from|sender|participants)\s*:\s*([^\s()"]+)') |
+                [regex]::Matches($q, '(?i)\b(?:from|sender|participants)\s*:\s*([^\s()"]+)') |
                     ForEach-Object { $_.Groups[1].Value }
             )
         }
