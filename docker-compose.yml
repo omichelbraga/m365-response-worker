@@ -1,5 +1,58 @@
 version: "3.8"
 
+# Published on 3024: 3020-3023 are already allocated on this host.
+#
+# VERIFY AGAINST THE MAILBOX, NOT eDISCOVERY. Measured side by side on one
+# mailbox, minutes apart: Graph returned empty for a message while an eDiscovery
+# estimate on the same query reported 2 items remaining - the message was gone
+# from Inbox and Deleted Items. eDiscovery reports deleted mail as present for
+# hours. /purge-verify reads the mailboxes named as the search's sources and
+# only falls back to an eDiscovery probe for a tenant-wide search.
+# Needs Mail.ReadBasic (application) - no message bodies.
+#
+# The sender parse that picks the mailbox path is CASE-INSENSITIVE. It used to
+# be 'From:"..."' only, so a caller writing lowercase 'from:' silently got the
+# eDiscovery probe and a false "7 items remaining" on a purged-clean mailbox
+# (Halo 0050661). n8n emits capital From: and was never affected.
+#
+# STRICTMODE: reading a MISSING property throws. Probe with
+# PSObject.Properties.Name before reading anything Graph may omit - 'Response'
+# on an exception, 'from' on a message. Both have cost a live run.
+#
+# EVERY slow endpoint MUST be a background job. HttpListener.GetContext() serves
+# one request at a time, so a synchronous multi-minute call takes the whole
+# worker offline - /health included. /search and /purge-verify answer 202 with a
+# job_id; poll /search-status?job_id=... for either.
+#
+# ASK EXCHANGE BEFORE BUILDING A SEARCH (/mailbox-check):
+#  * PROXY ADDRESSES are rejected by eDiscovery userSource with "User not found"
+#    even when the mailbox is real and active. eSentire reports @san-marcos.net
+#    while this tenant's primaries are @sanmarcosca.gov, so recipients must be
+#    resolved to PrimarySmtpAddress or they are silently never searched.
+#  * INACTIVE MAILBOXES cannot be searched by name, and one among the sources
+#    collapses the estimate for every other mailbox in the same search
+#    (measured: 4 active = 4 items; the same 4 plus one inactive = 1).
+#
+# SOFT DELETE IS A ONE-WAY DOOR for eDiscovery purposes: it moves the item to
+# Recoverable Items, which a later hard purge cannot reach.
+#
+# /recoverable reads Recoverable Items through GRAPH. Get-RecoverableItems is
+# gated behind the Mailbox Import Export RBAC role, and EXO omits cmdlets the
+# principal has no role for, so app-only auth saw CommandNotFoundException.
+#
+# Above tenant_wide_threshold recipients (default 25; site setting is 15) a
+# search goes tenant-wide without creating sources at all.
+#
+# DOTNET_SYSTEM_NET_DISABLEIPV6: the internal resolver returns only AAAA records
+# for graph.microsoft.com while this bridge network is IPv4-only, so .NET picks
+# an IPv6 address and the socket fails with "Network is unreachable" (surfacing
+# as HTTP 0). curl survives it by falling back to IPv4; the .NET HTTP client
+# does not.
+#
+# Every StackUpdate MUST resend the full Env list. Portainer does not merge:
+# an update without it silently clears every variable, which leaves this
+# worker running with WORKER_TOKEN unset -- i.e. accepting unauthenticated
+# requests that can delete mail.
 services:
   m365-response-worker:
     build:
@@ -10,22 +63,23 @@ services:
     ports:
       - "${WORKER_PORT:-3024}:8080"
     environment:
-      # App-only auth. The certificate is mounted, never baked into the image.
       - EXO_APP_ID=${EXO_APP_ID}
+      - EXO_TENANT_ID=${EXO_TENANT_ID}
       - EXO_ORGANIZATION=${EXO_ORGANIZATION}
       - EXO_CERT_PATH=/certs/exo.pfx
       - EXO_CERT_PASSWORD=${EXO_CERT_PASSWORD}
+      - EXO_SEARCH_ONLY_SESSION=${EXO_SEARCH_ONLY_SESSION:-0}
       - WORKER_TOKEN=${WORKER_TOKEN}
       - WORKER_PORT=8080
+      - DOTNET_SYSTEM_NET_DISABLEIPV6=1
     volumes:
-      # Place exo.pfx on the Docker host at this path, readable by uid 10002.
       - ${EXO_CERT_HOST_DIR:-/opt/m365-worker/certs}:/certs:ro
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "-fsS", "--max-time", "10", "http://localhost:8080/health"]
       interval: 30s
-      timeout: 10s
+      timeout: 15s
       retries: 3
-      start_period: 20s
+      start_period: 45s
     security_opt:
       - no-new-privileges:true
     networks:
@@ -38,6 +92,5 @@ networks:
     ipam:
       config:
         - subnet: 172.31.12.0/24
-  # Shared with the reverse proxy and n8n so they can reach this by name.
   mcp-edge:
     external: true
